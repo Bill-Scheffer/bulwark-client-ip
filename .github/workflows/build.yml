@@ -1,0 +1,119 @@
+# Builds Bulwark from its own release source with ONE change, patches/0001-forward-client-ip-to-jmap.patch:
+# server-side requests to the configured JMAP server can go to a private URL and carry the visitor's
+# IP (opt-in: JMAP_SERVER_INTERNAL_URL, JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong
+# password counts against the webmail server's own address at the JMAP server, and one attacker can
+# get that address banned, locking every user out. Everything else is upstream: the tag's source, its
+# Dockerfile. The image is pushed only after an end-to-end check against the built image passes.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # Upstream Bulwark release, pinned by commit: a tag can move, a commit cannot.
+  BULWARK_TAG: "1.11.2"
+  BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
+  IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
+  VERSION: 1.11.2-clientip.1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          path: patch
+
+      - name: Check out Bulwark at the pinned release commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          repository: bulwarkmail/webmail
+          ref: ${{ env.BULWARK_SHA }}
+          path: bulwark
+
+      - name: The release tag still names that commit
+        run: |
+          set -eu
+          tagged=$(git ls-remote https://github.com/bulwarkmail/webmail "refs/tags/${BULWARK_TAG}" | cut -f1)
+          echo "tag ${BULWARK_TAG} -> ${tagged}"
+          [ "$tagged" = "$BULWARK_SHA" ] || { echo "::error::${BULWARK_TAG} no longer points at ${BULWARK_SHA}"; exit 1; }
+
+      - name: Apply the patch, and prove it changed exactly its three files
+        working-directory: bulwark
+        run: |
+          set -eu
+          git apply --check ../patch/patches/0001-forward-client-ip-to-jmap.patch
+          git apply ../patch/patches/0001-forward-client-ip-to-jmap.patch
+          got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
+          want=$(printf '%s\n' ' M instrumentation.node.ts' '?? lib/__tests__/jmap-upstream-fetch.test.ts' '?? lib/server/' | LC_ALL=C sort | tr '\n' '|')
+          [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
+        with:
+          node-version: "24"
+
+      - name: The patch's own tests, and the typecheck
+        working-directory: bulwark
+        run: |
+          set -eu
+          npm ci --no-audit --no-fund --ignore-scripts
+          npx vitest run lib/__tests__/jmap-upstream-fetch.test.ts
+          npx tsc --noEmit -p tsconfig.json
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Build with Bulwark's own Dockerfile (loaded locally, not pushed yet)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
+        with:
+          context: bulwark
+          file: bulwark/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          provenance: false
+          build-args: |
+            GIT_COMMIT=${{ env.BULWARK_SHA }}
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP
+            org.opencontainers.image.licenses=AGPL-3.0-only
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: End-to-end against the built image
+        run: bash patch/scripts/e2e.sh "${IMAGE}:${VERSION}"
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push, only after the end-to-end check passed
+        run: |
+          set -eu
+          docker push "${IMAGE}:${VERSION}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}")
+          echo "pushed ${digest}"
+          {
+            echo "### ${IMAGE}"
+            echo "- tag: \`${VERSION}\`"
+            echo "- digest: \`${digest#*@}\`"
+            echo "- bulwark: \`${BULWARK_TAG}\` @ \`${BULWARK_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

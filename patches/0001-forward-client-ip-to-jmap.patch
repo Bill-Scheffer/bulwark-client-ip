@@ -1,0 +1,324 @@
+diff --git a/instrumentation.node.ts b/instrumentation.node.ts
+index 365427d..69b7aff 100644
+--- a/instrumentation.node.ts
++++ b/instrumentation.node.ts
+@@ -4,6 +4,10 @@ import { initAdminPassword } from "./lib/admin/password";
+ import { migrateLegacyAdminLayout, migratePolicyUnifiedMailbox } from "./lib/admin/migrate";
+ import { detectSetupState } from "./lib/setup/state";
+ import { ensureSetupToken } from "./lib/setup/token";
++import { installJmapUpstreamFetch } from "./lib/server/jmap-upstream-fetch";
++
++// Opt-in: send server-side JMAP requests privately and with the visitor's IP.
++installJmapUpstreamFetch();
+ 
+ const pkg = JSON.parse(
+   readFileSync(`${process.cwd()}/package.json`, "utf-8")
+diff --git a/lib/__tests__/jmap-upstream-fetch.test.ts b/lib/__tests__/jmap-upstream-fetch.test.ts
+new file mode 100644
+index 0000000..5b1a1a5
+--- /dev/null
++++ b/lib/__tests__/jmap-upstream-fetch.test.ts
+@@ -0,0 +1,152 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import {
++  clientIpFromHeaders,
++  installJmapUpstreamFetch,
++  wrapFetchForJmapUpstream,
++  type JmapUpstreamOptions,
++} from '@/lib/server/jmap-upstream-fetch';
++
++function capture() {
++  const calls: Request[] = [];
++  const base = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
++    calls.push(input instanceof Request && !init ? input : new Request(input as RequestInfo, init));
++    return new Response('ok');
++  });
++  return { base: base as unknown as typeof fetch, calls };
++}
++
++function opts(over: Partial<JmapUpstreamOptions> = {}): JmapUpstreamOptions {
++  return {
++    publicOrigin: 'https://mail.example.com',
++    internalBase: 'http://stalwart.mail.svc:8080',
++    forwardClientIp: true,
++    trustedProxyDepth: 1,
++    getRequestHeaders: async () => new Headers({ 'x-forwarded-for': '203.0.113.7' }),
++    ...over,
++  };
++}
++
++describe('clientIpFromHeaders', () => {
++  it('takes the rightmost entry at depth 1, like getClientIP', () => {
++    expect(clientIpFromHeaders(new Headers({ 'x-forwarded-for': '6.6.6.6, 203.0.113.7' }), 1)).toBe('203.0.113.7');
++  });
++  it('honours TRUSTED_PROXY_DEPTH', () => {
++    expect(clientIpFromHeaders(new Headers({ 'x-forwarded-for': '203.0.113.7, 10.0.0.2' }), 2)).toBe('203.0.113.7');
++  });
++  it('accepts IPv6 and falls back to x-real-ip', () => {
++    expect(clientIpFromHeaders(new Headers({ 'x-forwarded-for': '2001:db8::1' }), 1)).toBe('2001:db8::1');
++    expect(clientIpFromHeaders(new Headers({ 'x-real-ip': '198.51.100.4' }), 1)).toBe('198.51.100.4');
++  });
++  it('never returns something that is not an IP', () => {
++    expect(clientIpFromHeaders(new Headers({ 'x-forwarded-for': 'evil, not-an-ip' }), 1)).toBeNull();
++    // (A CR/LF cannot even reach here: the Headers class rejects it.)
++    expect(clientIpFromHeaders(new Headers({ 'x-forwarded-for': '1.2.3.4; injected=1' }), 1)).toBeNull();
++    expect(clientIpFromHeaders(new Headers({ 'x-forwarded-for': '1.2.3.4 5.6.7.8' }), 1)).toBeNull();
++    expect(clientIpFromHeaders(new Headers(), 1)).toBeNull();
++    expect(clientIpFromHeaders(new Headers({ 'x-real-ip': '0.0.0.0' }), 1)).toBeNull();
++  });
++});
++
++describe('wrapFetchForJmapUpstream', () => {
++  it('sends requests for the JMAP origin to the internal URL with the visitor IP', async () => {
++    const { base, calls } = capture();
++    await wrapFetchForJmapUpstream(base, opts())('https://mail.example.com/.well-known/jmap?x=1', {
++      headers: { Authorization: 'Basic abc' },
++      redirect: 'manual',
++    });
++    expect(calls[0].url).toBe('http://stalwart.mail.svc:8080/.well-known/jmap?x=1');
++    expect(calls[0].headers.get('x-forwarded-for')).toBe('203.0.113.7');
++    expect(calls[0].headers.get('authorization')).toBe('Basic abc');
++    expect(calls[0].redirect).toBe('manual');
++  });
++
++  it('rewrites the absolute redirect target the JMAP server hands back', async () => {
++    const { base, calls } = capture();
++    await wrapFetchForJmapUpstream(base, opts())('https://mail.example.com/jmap/session');
++    expect(calls[0].url).toBe('http://stalwart.mail.svc:8080/jmap/session');
++  });
++
++  it('leaves every other destination untouched, with no forwarded header', async () => {
++    const { base, calls } = capture();
++    await wrapFetchForJmapUpstream(base, opts())('https://relay.example.net/api/push', { method: 'POST', body: 'x' });
++    expect(calls[0].url).toBe('https://relay.example.net/api/push');
++    expect(calls[0].headers.get('x-forwarded-for')).toBeNull();
++  });
++
++  it('replaces any caller-supplied X-Forwarded-For or Forwarded', async () => {
++    const { base, calls } = capture();
++    await wrapFetchForJmapUpstream(base, opts())('https://mail.example.com/jmap/', {
++      headers: { 'X-Forwarded-For': '10.42.0.9', Forwarded: 'for=10.42.0.9' },
++    });
++    expect(calls[0].headers.get('x-forwarded-for')).toBe('203.0.113.7');
++    expect(calls[0].headers.get('forwarded')).toBeNull();
++  });
++
++  it('forwards nothing when the visitor IP is unknown or malformed', async () => {
++    for (const getRequestHeaders of [async () => null, async () => new Headers({ 'x-forwarded-for': 'garbage' })]) {
++      const { base, calls } = capture();
++      await wrapFetchForJmapUpstream(base, opts({ getRequestHeaders }))('https://mail.example.com/jmap/', {
++        headers: { 'X-Forwarded-For': '10.42.0.9' },
++      });
++      expect(calls[0].headers.get('x-forwarded-for')).toBeNull();
++    }
++  });
++
++  it('keeps method and body, and accepts a Request as input', async () => {
++    const { base, calls } = capture();
++    const req = new Request('https://mail.example.com/jmap/', { method: 'POST', body: '{"using":[]}' });
++    await wrapFetchForJmapUpstream(base, opts())(req);
++    expect(calls[0].method).toBe('POST');
++    expect(await calls[0].text()).toBe('{"using":[]}');
++    expect(calls[0].url).toBe('http://stalwart.mail.svc:8080/jmap/');
++  });
++
++  it('with no internal URL keeps the public URL but still forwards the IP', async () => {
++    const { base, calls } = capture();
++    await wrapFetchForJmapUpstream(base, opts({ internalBase: null }))('https://mail.example.com/jmap/');
++    expect(calls[0].url).toBe('https://mail.example.com/jmap/');
++    expect(calls[0].headers.get('x-forwarded-for')).toBe('203.0.113.7');
++  });
++
++  it('with forwarding off rewrites only, and still strips a stray header', async () => {
++    const { base, calls } = capture();
++    await wrapFetchForJmapUpstream(base, opts({ forwardClientIp: false }))('https://mail.example.com/jmap/', {
++      headers: { 'X-Forwarded-For': '1.1.1.1' },
++    });
++    expect(calls[0].url).toBe('http://stalwart.mail.svc:8080/jmap/');
++    expect(calls[0].headers.get('x-forwarded-for')).toBeNull();
++  });
++});
++
++describe('installJmapUpstreamFetch', () => {
++  const original = globalThis.fetch;
++  afterEach(() => {
++    globalThis.fetch = original;
++  });
++
++  it('is a no-op unless opted in', () => {
++    expect(installJmapUpstreamFetch({ JMAP_SERVER_URL: 'https://mail.example.com' } as unknown as NodeJS.ProcessEnv)).toBe(false);
++    expect(globalThis.fetch).toBe(original);
++  });
++
++  it('installs when opted in', () => {
++    expect(
++      installJmapUpstreamFetch({
++        JMAP_SERVER_URL: 'https://mail.example.com',
++        JMAP_SERVER_INTERNAL_URL: 'http://stalwart:8080',
++        JMAP_FORWARD_CLIENT_IP: 'true',
++      } as unknown as NodeJS.ProcessEnv),
++    ).toBe(true);
++    expect(globalThis.fetch).not.toBe(original);
++  });
++
++  it('refuses a malformed URL rather than installing something half-configured', () => {
++    expect(
++      installJmapUpstreamFetch({
++        JMAP_SERVER_URL: 'https://mail.example.com',
++        JMAP_SERVER_INTERNAL_URL: 'not a url',
++      } as unknown as NodeJS.ProcessEnv),
++    ).toBe(false);
++    expect(globalThis.fetch).toBe(original);
++  });
++});
+diff --git a/lib/server/jmap-upstream-fetch.ts b/lib/server/jmap-upstream-fetch.ts
+new file mode 100644
+index 0000000..09b06ed
+--- /dev/null
++++ b/lib/server/jmap-upstream-fetch.ts
+@@ -0,0 +1,145 @@
++/**
++ * Server-side requests to the configured JMAP server, made on a visitor's behalf.
++ *
++ * The login pre-check, the session route and every other server-side call reach
++ * the JMAP server from THIS server's address. The JMAP server's authentication
++ * limiter (Stalwart's auto-ban) then counts every visitor's wrong password
++ * against one shared address, so a single attacker can ban it and lock every
++ * user out at once. `lib/auth/verify-budget.ts` caps the pre-check to soften
++ * that; this closes it, opt-in, for deployments where the JMAP server is
++ * reachable privately and trusts this app as a proxy:
++ *
++ *   JMAP_SERVER_INTERNAL_URL  requests whose origin is JMAP_SERVER_URL's are sent
++ *                             here instead (e.g. http://stalwart:8080), so they
++ *                             never leave the private network.
++ *   JMAP_FORWARD_CLIENT_IP    "true": they carry X-Forwarded-For with the
++ *                             visitor's address, derived exactly as
++ *                             getClientIP() does (TRUSTED_PROXY_DEPTH).
++ *
++ * Only requests to that one origin are touched. The JMAP server must itself
++ * trust X-Forwarded-For from this app (Stalwart: `useXForwarded`), and must not
++ * be reachable by anything else that could set the header.
++ */
++
++import { isIP } from 'node:net';
++
++type FetchFn = typeof fetch;
++
++export interface JmapUpstreamOptions {
++  /** Origin of JMAP_SERVER_URL, e.g. https://mail.example.com */
++  publicOrigin: string;
++  /** Base URL to send those requests to instead, or null to keep the public one. */
++  internalBase: string | null;
++  /** Add X-Forwarded-For with the visitor's address. */
++  forwardClientIp: boolean;
++  trustedProxyDepth: number;
++  /** Headers of the request being served, or null outside a request. */
++  getRequestHeaders: () => Promise<Headers | null>;
++}
++
++/**
++ * The visitor's address from the incoming request's headers, with the same
++ * rightmost-trusted rule as getClientIP() in lib/admin/session.ts. Returns null
++ * unless it is a literal IP address, so a malformed header is never forwarded.
++ */
++export function clientIpFromHeaders(headers: Headers, trustedProxyDepth: number): string | null {
++  const forwarded = headers.get('x-forwarded-for');
++  let candidate: string | null = null;
++  if (forwarded) {
++    const parts = forwarded.split(',').map((s) => s.trim()).filter(Boolean);
++    const index = Math.max(0, parts.length - Math.max(1, trustedProxyDepth));
++    candidate = parts[index] ?? null;
++  } else {
++    candidate = headers.get('x-real-ip');
++  }
++  if (!candidate || isIP(candidate) === 0 || candidate === '0.0.0.0') return null;
++  return candidate;
++}
++
++function urlOf(input: RequestInfo | URL): string {
++  if (typeof input === 'string') return input;
++  if (input instanceof URL) return input.href;
++  return input.url;
++}
++
++export function wrapFetchForJmapUpstream(base: FetchFn, opts: JmapUpstreamOptions): FetchFn {
++  const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
++    let parsed: URL;
++    try {
++      parsed = new URL(urlOf(input));
++    } catch {
++      return base(input, init);
++    }
++    if (parsed.origin !== opts.publicOrigin) return base(input, init);
++
++    const target = opts.internalBase
++      ? new URL(parsed.pathname + parsed.search, opts.internalBase).href
++      : parsed.href;
++
++    // Normalise to one Request so headers from both the input and init apply.
++    const original = new Request(input, init);
++    const headers = new Headers(original.headers);
++    // Never pass on a value this server did not derive itself.
++    headers.delete('x-forwarded-for');
++    headers.delete('forwarded');
++    if (opts.forwardClientIp) {
++      const requestHeaders = await opts.getRequestHeaders();
++      const ip = requestHeaders ? clientIpFromHeaders(requestHeaders, opts.trustedProxyDepth) : null;
++      if (ip) headers.set('x-forwarded-for', ip);
++    }
++
++    const body = original.method === 'GET' || original.method === 'HEAD' ? undefined : original.body;
++    return base(
++      new Request(target, {
++        method: original.method,
++        headers,
++        body,
++        redirect: original.redirect,
++        signal: original.signal,
++        // Required by undici whenever a stream body is passed.
++        ...(body ? { duplex: 'half' } : {}),
++      } as RequestInit),
++    );
++  };
++  return wrapped as FetchFn;
++}
++
++/**
++ * Wrap globalThis.fetch once, from instrumentation, when either option is set.
++ * A no-op otherwise, so deployments that do not opt in are unchanged.
++ */
++export function installJmapUpstreamFetch(env: NodeJS.ProcessEnv = process.env): boolean {
++  const publicUrl = env.JMAP_SERVER_URL || env.NEXT_PUBLIC_JMAP_SERVER_URL || '';
++  const internalBase = env.JMAP_SERVER_INTERNAL_URL || null;
++  const forwardClientIp = env.JMAP_FORWARD_CLIENT_IP === 'true';
++  if (!publicUrl || (!internalBase && !forwardClientIp)) return false;
++
++  let publicOrigin: string;
++  try {
++    publicOrigin = new URL(publicUrl).origin;
++    if (internalBase) new URL(internalBase);
++  } catch {
++    console.warn('[jmap-upstream] JMAP_SERVER_URL or JMAP_SERVER_INTERNAL_URL is not a URL; not installed');
++    return false;
++  }
++
++  globalThis.fetch = wrapFetchForJmapUpstream(globalThis.fetch.bind(globalThis), {
++    publicOrigin,
++    internalBase,
++    forwardClientIp,
++    trustedProxyDepth: parseInt(env.TRUSTED_PROXY_DEPTH || '1', 10) || 1,
++    getRequestHeaders: async () => {
++      try {
++        const { headers } = await import('next/headers');
++        return new Headers(await headers());
++      } catch {
++        return null; // not inside a request (startup, background jobs)
++      }
++    },
++  });
++  console.info(
++    `[jmap-upstream] ${publicOrigin} -> ${internalBase ?? publicOrigin}` +
++      (forwardClientIp ? ', forwarding the client IP' : ''),
++  );
++  return true;
++}
