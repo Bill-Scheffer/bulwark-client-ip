@@ -1,9 +1,14 @@
-# Builds Bulwark from its own release source with ONE change, patches/0001-forward-client-ip-to-jmap.patch:
-# server-side requests to the configured JMAP server can go to a private URL and carry the visitor's
-# IP (opt-in: JMAP_SERVER_INTERNAL_URL, JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong
-# password counts against the webmail server's own address at the JMAP server, and one attacker can
-# get that address banned, locking every user out. Everything else is upstream: the tag's source, its
-# Dockerfile. The image is pushed only after an end-to-end check against the built image passes.
+# Builds Bulwark from its own release source with two patches:
+#   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
+#     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
+#     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
+#     server's own address at the JMAP server, and one attacker can get that address banned, locking
+#     every user out.
+#   0002-push-relay-build-arg.patch: a build argument for the default push relay
+#     (NEXT_PUBLIC_PUSH_RELAY_URL), which upstream reads at build time but its Dockerfile never passes.
+#     This build sets it to PUSH_RELAY_URL below, so the client never contacts the hosted relay.
+# Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
+# end-to-end check against the built image passes.
 name: build
 
 on:
@@ -25,7 +30,10 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.2
+  VERSION: 1.11.2-clientip.3
+  # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
+  # webmail host. Baked into the client bundle.
+  PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
 
 jobs:
   build:
@@ -51,14 +59,16 @@ jobs:
           echo "tag ${BULWARK_TAG} -> ${tagged}"
           [ "$tagged" = "$BULWARK_SHA" ] || { echo "::error::${BULWARK_TAG} no longer points at ${BULWARK_SHA}"; exit 1; }
 
-      - name: Apply the patch, and prove it changed exactly its three files
+      - name: Apply the patches, and prove they changed exactly their four files
         working-directory: bulwark
         run: |
           set -eu
-          git apply --check ../patch/patches/0001-forward-client-ip-to-jmap.patch
-          git apply ../patch/patches/0001-forward-client-ip-to-jmap.patch
+          for p in ../patch/patches/0001-forward-client-ip-to-jmap.patch ../patch/patches/0002-push-relay-build-arg.patch; do
+            git apply --check "$p"
+            git apply "$p"
+          done
           got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
-          want=$(printf '%s\n' ' M instrumentation.node.ts' '?? lib/__tests__/jmap-upstream-fetch.test.ts' '?? lib/server/' | LC_ALL=C sort | tr '\n' '|')
+          want=$(printf '%s\n' ' M Dockerfile' ' M instrumentation.node.ts' '?? lib/__tests__/jmap-upstream-fetch.test.ts' '?? lib/server/' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
@@ -86,18 +96,19 @@ jobs:
           provenance: false
           build-args: |
             GIT_COMMIT=${{ env.BULWARK_SHA }}
+            NEXT_PUBLIC_PUSH_RELAY_URL=${{ env.PUSH_RELAY_URL }}
           tags: ${{ env.IMAGE }}:${{ env.VERSION }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
-            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP
+            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP, and ${{ env.PUSH_RELAY_URL }} as its push relay
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: End-to-end against the built image
-        run: bash patch/scripts/e2e.sh "${IMAGE}:${VERSION}"
+        run: bash patch/scripts/e2e.sh "${IMAGE}:${VERSION}" "${PUSH_RELAY_URL}"
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:

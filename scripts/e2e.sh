@@ -4,6 +4,7 @@
 # records what reaches it; a real sign-in pre-check is sent through the image.
 set -euo pipefail
 IMAGE="$1"
+RELAY="${2:-}"
 cleanup() { docker rm -f e2e-echo e2e-bw e2e-bw-off >/dev/null 2>&1 || true; docker network rm e2e >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
@@ -65,4 +66,12 @@ answer=$(verify e2e-bw-off); echo "verify -> $answer"
 sleep 1
 after=$(docker logs e2e-echo 2>&1 | wc -l)
 [ "$before" = "$after" ] || { echo "::error::the stub was reached without opting in"; exit 1; }
+if [ -n "$RELAY" ]; then
+  echo "== the push relay is ours, baked into the shipped code, and the hosted one is not"
+  ours=$(docker run --rm --entrypoint sh "$IMAGE" -c "grep -rlF '$RELAY' /app/.next | wc -l")
+  hosted=$(docker run --rm --entrypoint sh "$IMAGE" -c "grep -rlF 'notifications.relay.bulwarkmail.org' /app/.next | wc -l")
+  echo "files naming $RELAY: $ours; naming the hosted relay: $hosted"
+  [ "$ours" -gt 0 ] || { echo "::error::$RELAY is not in the built code"; exit 1; }
+  [ "$hosted" -eq 0 ] || { echo "::error::the hosted relay is still in the built code"; exit 1; }
+fi
 echo "e2e: OK"

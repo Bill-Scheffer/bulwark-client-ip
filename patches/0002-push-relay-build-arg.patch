@@ -1,0 +1,15 @@
+diff --git a/Dockerfile b/Dockerfile
+index b36abc8..451caba 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -17,6 +17,10 @@ ENV NEXT_PUBLIC_LOCALE_PREFIX=$NEXT_PUBLIC_LOCALE_PREFIX
+ # build time because next-intl wires it into client-side routing too.
+ ARG NEXT_PUBLIC_DEFAULT_LOCALE=
+ ENV NEXT_PUBLIC_DEFAULT_LOCALE=$NEXT_PUBLIC_DEFAULT_LOCALE
++# Optional: the push relay offered by default (lib/push-relays.ts). Baked into
++# the client bundle at build time; empty keeps the hosted relay.
++ARG NEXT_PUBLIC_PUSH_RELAY_URL=
++ENV NEXT_PUBLIC_PUSH_RELAY_URL=$NEXT_PUBLIC_PUSH_RELAY_URL
+ # Commit SHA shown in the About screen. .dockerignore excludes .git, so
+ # `git rev-parse` inside the build can't find it - CI must pass it in.
+ ARG GIT_COMMIT=unknown
