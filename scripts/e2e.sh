@@ -24,10 +24,13 @@ start() { # name, extra env...
   done
   docker logs "$name" | tail -20; echo "::error::$name did not become healthy"; exit 1
 }
-verify() { # name -> the route's JSON answer, for a visitor at 203.0.113.9
-  docker exec "$1" node -e '
+verify() { # name [xff] -> the route's JSON answer; xff defaults to 203.0.113.9, "none" sends no header
+  local xff=${2:-203.0.113.9}
+  docker exec -e XFF="$xff" "$1" node -e '
+    const h = { "content-type": "application/json", "sec-fetch-site": "same-origin" };
+    if (process.env.XFF !== "none") h["x-forwarded-for"] = process.env.XFF;
     fetch("http://127.0.0.1:3000/api/auth/verify", { method: "POST",
-      headers: { "content-type": "application/json", "sec-fetch-site": "same-origin", "x-forwarded-for": "203.0.113.9" },
+      headers: h,
       body: JSON.stringify({ serverUrl: "https://mail.example.test", username: "u@example.test", password: "wrong" }) })
     .then(r => r.text()).then(t => console.log(t))'
 }
@@ -43,6 +46,16 @@ echo "$answer" | grep -q '"unauthorized"' || { echo "::error::expected unauthori
 echo "$seen" | grep -q '"url":"/.well-known/jmap"' || { echo "::error::the request did not reach the internal URL"; exit 1; }
 echo "$seen" | grep -q '"xff":"203.0.113.9"' || { echo "::error::the visitor IP was not forwarded"; exit 1; }
 echo "$seen" | grep -q '"auth":true' || { echo "::error::Authorization was not passed through"; exit 1; }
+
+echo "== fails closed: no visitor IP, or an internal one, must reach the stub as 192.0.2.1, never nothing"
+for xff in none 10.42.0.9; do
+  n0=$(docker logs e2e-echo 2>&1 | wc -l)
+  answer=$(verify e2e-bw "$xff"); echo "verify (xff=$xff) -> $answer"
+  sleep 1
+  last=$(docker logs e2e-echo 2>&1 | tail -n +$((n0+1)))
+  echo "stub saw: $last"
+  echo "$last" | grep -q '"xff":"192.0.2.1"' || { echo "::error::xff=$xff did not become the 192.0.2.1 sentinel"; exit 1; }
+done
 
 echo "== negative control: same image, NOT opted in, must not touch the stub"
 before=$(docker logs e2e-echo 2>&1 | wc -l)

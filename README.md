@@ -25,6 +25,8 @@ typical daily ban threshold, and the session route has no budget.
 | `JMAP_SERVER_INTERNAL_URL` | send those requests to this private base URL instead (e.g. `http://stalwart:8080`) |
 | `JMAP_FORWARD_CLIENT_IP=true` | add `X-Forwarded-For: <visitor IP>`, derived exactly as Bulwark's `getClientIP()` (`TRUSTED_PROXY_DEPTH`); anything that is not a literal IP is never forwarded, and a caller-supplied value is always replaced |
 
+⛔ **It fails closed.** A request sent to the internal URL always carries an `X-Forwarded-For`, and never an internal address: when no public visitor IP is known (no request context, a malformed header, an address in `10.0.0.0/8` or loopback, or forwarding off) it carries `192.0.2.1` (TEST-NET-1). Omitting the header would make the JMAP server fall back to the socket peer, this app's own private address, and a check that trusts private addresses (an API key restricted to the pod network) would pass for a request from outside.
+
 Nothing else is touched: other destinations, and user-chosen custom endpoints (which use a separate,
 guarded fetch path), are unchanged. Unset, the image behaves exactly like upstream. ⚠️ The JMAP server
 must trust `X-Forwarded-For` from this app (Stalwart: `useXForwarded`) and be reachable only by peers

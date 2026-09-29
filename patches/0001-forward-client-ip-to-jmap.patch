@@ -15,14 +15,16 @@ index 365427d..69b7aff 100644
    readFileSync(`${process.cwd()}/package.json`, "utf-8")
 diff --git a/lib/__tests__/jmap-upstream-fetch.test.ts b/lib/__tests__/jmap-upstream-fetch.test.ts
 new file mode 100644
-index 0000000..5b1a1a5
+index 0000000..e3a2496
 --- /dev/null
 +++ b/lib/__tests__/jmap-upstream-fetch.test.ts
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,171 @@
 +import { afterEach, describe, expect, it, vi } from 'vitest';
 +import {
++  UNATTRIBUTED_CLIENT_IP,
 +  clientIpFromHeaders,
 +  installJmapUpstreamFetch,
++  isInternalAddress,
 +  wrapFetchForJmapUpstream,
 +  type JmapUpstreamOptions,
 +} from '@/lib/server/jmap-upstream-fetch';
@@ -46,6 +48,17 @@ index 0000000..5b1a1a5
 +    ...over,
 +  };
 +}
++
++describe('isInternalAddress', () => {
++  it('flags 10/8, loopback and their mapped forms, and nothing public', () => {
++    for (const ip of ['10.0.0.1', '10.42.3.4', '127.0.0.1', '::ffff:10.1.2.3', '::FFFF:127.0.0.1', '::1']) {
++      expect(isInternalAddress(ip), ip).toBe(true);
++    }
++    for (const ip of ['203.0.113.7', '11.0.0.1', '100.64.0.1', '2001:db8::1', '::ffff:203.0.113.7']) {
++      expect(isInternalAddress(ip), ip).toBe(false);
++    }
++  });
++});
 +
 +describe('clientIpFromHeaders', () => {
 +  it('takes the rightmost entry at depth 1, like getClientIP', () => {
@@ -103,13 +116,19 @@ index 0000000..5b1a1a5
 +    expect(calls[0].headers.get('forwarded')).toBeNull();
 +  });
 +
-+  it('forwards nothing when the visitor IP is unknown or malformed', async () => {
-+    for (const getRequestHeaders of [async () => null, async () => new Headers({ 'x-forwarded-for': 'garbage' })]) {
++  it('fails closed: an unknown, malformed or internal visitor IP becomes the sentinel, never nothing', async () => {
++    for (const getRequestHeaders of [
++      async () => null,
++      async () => new Headers({ 'x-forwarded-for': 'garbage' }),
++      async () => new Headers({ 'x-forwarded-for': '10.42.0.9' }),
++      async () => new Headers({ 'x-forwarded-for': '::ffff:10.42.0.9' }),
++      async () => new Headers({ 'x-real-ip': '127.0.0.1' }),
++    ]) {
 +      const { base, calls } = capture();
 +      await wrapFetchForJmapUpstream(base, opts({ getRequestHeaders }))('https://mail.example.com/jmap/', {
 +        headers: { 'X-Forwarded-For': '10.42.0.9' },
 +      });
-+      expect(calls[0].headers.get('x-forwarded-for')).toBeNull();
++      expect(calls[0].headers.get('x-forwarded-for')).toBe(UNATTRIBUTED_CLIENT_IP);
 +    }
 +  });
 +
@@ -129,13 +148,13 @@ index 0000000..5b1a1a5
 +    expect(calls[0].headers.get('x-forwarded-for')).toBe('203.0.113.7');
 +  });
 +
-+  it('with forwarding off rewrites only, and still strips a stray header', async () => {
++  it('with forwarding off, an internal request still carries the sentinel, never a caller value', async () => {
 +    const { base, calls } = capture();
 +    await wrapFetchForJmapUpstream(base, opts({ forwardClientIp: false }))('https://mail.example.com/jmap/', {
 +      headers: { 'X-Forwarded-For': '1.1.1.1' },
 +    });
 +    expect(calls[0].url).toBe('http://stalwart.mail.svc:8080/jmap/');
-+    expect(calls[0].headers.get('x-forwarded-for')).toBeNull();
++    expect(calls[0].headers.get('x-forwarded-for')).toBe(UNATTRIBUTED_CLIENT_IP);
 +  });
 +});
 +
@@ -173,10 +192,10 @@ index 0000000..5b1a1a5
 +});
 diff --git a/lib/server/jmap-upstream-fetch.ts b/lib/server/jmap-upstream-fetch.ts
 new file mode 100644
-index 0000000..09b06ed
+index 0000000..51e1b7b
 --- /dev/null
 +++ b/lib/server/jmap-upstream-fetch.ts
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,175 @@
 +/**
 + * Server-side requests to the configured JMAP server, made on a visitor's behalf.
 + *
@@ -198,9 +217,35 @@ index 0000000..09b06ed
 + * Only requests to that one origin are touched. The JMAP server must itself
 + * trust X-Forwarded-For from this app (Stalwart: `useXForwarded`), and must not
 + * be reachable by anything else that could set the header.
++ *
++ * FAILS CLOSED. A request sent to the internal URL ALWAYS carries an
++ * X-Forwarded-For, and never an internal address: when the visitor's IP cannot
++ * be derived (no request context, a malformed header), when it is itself an
++ * internal address (10.0.0.0/8, loopback, or their IPv4-mapped forms), or when
++ * forwarding is off, it carries UNATTRIBUTED_CLIENT_IP instead. Otherwise the
++ * JMAP server would fall back to the socket peer, this app's own private
++ * address, and a check that trusts private addresses (for example an API key
++ * restricted to the pod network) would pass for a request that came from
++ * outside.
 + */
 +
 +import { isIP } from 'node:net';
++
++/**
++ * Sent when no public visitor address is known: TEST-NET-1 (RFC 5737), never a
++ * real client and never an internal range.
++ */
++export const UNATTRIBUTED_CLIENT_IP = '192.0.2.1';
++
++/** 10.0.0.0/8 and 127.0.0.0/8 (plain or IPv4-mapped), and IPv6 loopback. */
++export function isInternalAddress(ip: string): boolean {
++  const v4 = ip.toLowerCase().startsWith('::ffff:') ? ip.slice(7) : ip;
++  if (isIP(v4) === 4) {
++    const first = Number(v4.split('.')[0]);
++    return first === 10 || first === 127;
++  }
++  return ip === '::1';
++}
 +
 +type FetchFn = typeof fetch;
 +
@@ -261,11 +306,15 @@ index 0000000..09b06ed
 +    // Never pass on a value this server did not derive itself.
 +    headers.delete('x-forwarded-for');
 +    headers.delete('forwarded');
++    let ip: string | null = null;
 +    if (opts.forwardClientIp) {
 +      const requestHeaders = await opts.getRequestHeaders();
-+      const ip = requestHeaders ? clientIpFromHeaders(requestHeaders, opts.trustedProxyDepth) : null;
-+      if (ip) headers.set('x-forwarded-for', ip);
++      ip = requestHeaders ? clientIpFromHeaders(requestHeaders, opts.trustedProxyDepth) : null;
++      if (ip && isInternalAddress(ip)) ip = null;
 +    }
++    // Fail closed (header): an internal request never goes without one.
++    if (ip) headers.set('x-forwarded-for', ip);
++    else if (opts.forwardClientIp || opts.internalBase) headers.set('x-forwarded-for', UNATTRIBUTED_CLIENT_IP);
 +
 +    const body = original.method === 'GET' || original.method === 'HEAD' ? undefined : original.body;
 +    return base(

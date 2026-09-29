@@ -25,7 +25,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.1
+  VERSION: 1.11.2-clientip.2
 
 jobs:
   build:
