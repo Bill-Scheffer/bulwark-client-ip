@@ -71,6 +71,20 @@ no session context at all, an expired token with no refresh token, a renewed tok
 refused, a session that would not open, a probe that threw. Each now logs one warning with the slot
 and reason, never a value; the no-session one lists the NAMES of the cookies that arrived.
 
+## Remembered sign-ins
+
+[`patches/0006-push-preview-restores-remembered-session.patch`](patches/0006-push-preview-restores-remembered-session.patch).
+0005's first real warning named the cause: `push preview found no session context`, with only
+`jmap_session` among the cookies. A "remember me" sign-in is Basic: its credentials sit in that 30-day
+cookie, and the context the server routes read is a browser-session cookie. When a push wakes a phone
+and its browser comes back from being killed in the background, the session cookie is gone and the
+remembered one is not, so the preview answered 401 and the notification was generic. Opening the app
+fixed it for a while because the app's own restore (`GET /api/auth/session`) rebuilds the context.
+The preview now does the same, through one helper both routes use
+(`restoreStalwartAuthContextFromSession`). Nothing new persists: it reads a cookie that already does.
+The renewal e2e's last step signs in with "remember me", drops the context cookie, and needs the
+preview to answer 200 and store a fresh context; against `clientip.6` it fails there.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with five patches:
+# Builds Bulwark from its own release source with six patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -17,6 +17,10 @@
 #   0005-push-preview-says-why.patch: the push preview logs a warning on each path that answers 401
 #     (never a value; the no-session case names which cookies arrived), so a generic notification
 #     can be traced to its cause.
+#   0006-push-preview-restores-remembered-session.patch: a "remember me" sign-in keeps a 30-day cookie
+#     but its context cookie ends with the browser session, so a phone's browser restarted by a push
+#     comes back without it and the preview answered 401. The preview now rebuilds the context from
+#     the remembered sign-in, through the helper the app's own restore uses.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -40,7 +44,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.6
+  VERSION: 1.11.2-clientip.7
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -76,7 +80,8 @@ jobs:
           for p in ../patch/patches/0001-forward-client-ip-to-jmap.patch ../patch/patches/0002-push-relay-build-arg.patch \
                    ../patch/patches/0003-push-preview-renews-expired-session.patch \
                    ../patch/patches/0004-notification-badge.patch \
-                   ../patch/patches/0005-push-preview-says-why.patch; do
+                   ../patch/patches/0005-push-preview-says-why.patch \
+                   ../patch/patches/0006-push-preview-restores-remembered-session.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -85,7 +90,8 @@ jobs:
             ' M app/api/auth/token/route.ts' ' M app/api/push/preview/route.ts' ' M lib/__tests__/push-preview-route.test.ts' \
             '?? lib/oauth/refresh-slot.ts' '?? lib/__tests__/refresh-slot.test.ts' \
             ' M .env.example' ' M app/api/pwa-icon/[size]/route.ts' ' M lib/admin/types.ts' ' M public/sw.js' \
-            '?? lib/__tests__/pwa-icon-badge.test.ts' | LC_ALL=C sort | tr '\n' '|')
+            '?? lib/__tests__/pwa-icon-badge.test.ts' \
+            ' M app/api/auth/session/route.ts' ' M lib/stalwart/auth-context.ts' '?? lib/__tests__/auth-context-restore.test.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
@@ -99,7 +105,10 @@ jobs:
           npm ci --no-audit --no-fund --ignore-scripts
           npx vitest run lib/__tests__/jmap-upstream-fetch.test.ts lib/__tests__/push-preview-route.test.ts lib/__tests__/refresh-slot.test.ts \
             lib/__tests__/oauth-token-route.test.ts lib/__tests__/auth-routes-same-origin.test.ts \
-            lib/__tests__/pwa-icon-badge.test.ts lib/__tests__/domain-branding.test.ts lib/__tests__/branding-asset.test.ts
+            lib/__tests__/pwa-icon-badge.test.ts lib/__tests__/domain-branding.test.ts lib/__tests__/branding-asset.test.ts \
+            lib/__tests__/auth-context-restore.test.ts lib/__tests__/impersonation-session.test.ts \
+            lib/__tests__/auth-routes-credential-check.test.ts lib/__tests__/settings-route-account-key.test.ts \
+            lib/__tests__/wopi-token-not-a-session.test.ts
           npx tsc --noEmit -p tsconfig.json
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0

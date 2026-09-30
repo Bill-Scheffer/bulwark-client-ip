@@ -1,0 +1,218 @@
+diff --git a/app/api/auth/session/route.ts b/app/api/auth/session/route.ts
+index 1a43406..ae06061 100644
+--- a/app/api/auth/session/route.ts
++++ b/app/api/auth/session/route.ts
+@@ -7,6 +7,7 @@ import { getCookieOptions } from '@/lib/oauth/cookie-config';
+ import { JmapAuthVerificationError, verifyJmapIdentity } from '@/lib/auth/verify-jmap-auth';
+ import {
+   clearStalwartAuthContextInStore,
++  restoreStalwartAuthContextFromSession,
+   setStalwartAuthContextInStore,
+ } from '@/lib/stalwart/auth-context';
+ import { configManager } from '@/lib/admin/config-manager';
+@@ -168,21 +169,15 @@ export async function GET(request: NextRequest) {
+       return NextResponse.json({ error: 'No session' }, { status: 401 });
+     }
+ 
+-    const credentials = decryptSession(token);
+-    if (!credentials) {
++    const context = restoreStalwartAuthContextFromSession(cookieStore, slot);
++    if (!context) {
+       cookieStore.delete(cookieName);
+       clearStalwartAuthContextInStore(cookieStore, slot);
+       return NextResponse.json({ error: 'Invalid session' }, { status: 401 });
+     }
+ 
+-    setStalwartAuthContextInStore(cookieStore, slot, {
+-      serverUrl: credentials.serverUrl,
+-      username: credentials.username,
+-      authHeader: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`,
+-    });
+-
+     // Only return non-sensitive fields. Use PUT to retrieve full credentials.
+-    const { serverUrl, username } = credentials;
++    const { serverUrl, username } = context;
+     return NextResponse.json(
+       { serverUrl, username },
+       { headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' } },
+diff --git a/app/api/push/preview/route.ts b/app/api/push/preview/route.ts
+index 3dfdd24..9989f69 100644
+--- a/app/api/push/preview/route.ts
++++ b/app/api/push/preview/route.ts
+@@ -4,6 +4,7 @@ import { logger } from '@/lib/logger';
+ import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
+ import {
+   readStalwartAuthContextFromStore,
++  restoreStalwartAuthContextFromSession,
+   setStalwartAuthContextInStore,
+ } from '@/lib/stalwart/auth-context';
+ import {
+@@ -72,7 +73,10 @@ async function resolveTargetForAccount(
+   const cookieStore = await cookies();
+   const probes: Promise<ResolvedTarget | null>[] = [];
+   for (let slot = 0; slot < MAX_ACCOUNT_SLOTS; slot++) {
+-    const ctx = readStalwartAuthContextFromStore(cookieStore, slot);
++    // A browser restarted in the background (a push waking a phone) keeps the
++    // remembered sign-in but not the context; rebuild it, as the app does.
++    const ctx = readStalwartAuthContextFromStore(cookieStore, slot)
++      ?? restoreStalwartAuthContextFromSession(cookieStore, slot);
+     if (!ctx) continue;
+     const serverUrl = ctx.serverUrl.replace(/\/+$/, '');
+     probes.push(
+diff --git a/lib/__tests__/auth-context-restore.test.ts b/lib/__tests__/auth-context-restore.test.ts
+new file mode 100644
+index 0000000..8ffa3ed
+--- /dev/null
++++ b/lib/__tests__/auth-context-restore.test.ts
+@@ -0,0 +1,62 @@
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++
++vi.mock('@/lib/auth/session-secret', () => ({
++  getSessionSecret: () => 'test-session-secret-at-least-32-characters-long',
++}));
++vi.mock('@/lib/logger', () => ({
++  logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn(), info: vi.fn() },
++}));
++vi.mock('@/lib/oauth/cookie-config', () => ({
++  getCookieOptions: () => ({ httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 2592000 }),
++}));
++
++class FakeCookies {
++  store = new Map<string, string>();
++  get(name: string) {
++    const value = this.store.get(name);
++    return value === undefined ? undefined : { name, value };
++  }
++  set(name: string, value: string) {
++    this.store.set(name, value);
++  }
++  delete(name: string) {
++    this.store.delete(name);
++  }
++}
++
++describe('restoreStalwartAuthContextFromSession', () => {
++  let jar: FakeCookies;
++  beforeEach(() => {
++    jar = new FakeCookies();
++  });
++
++  it('rebuilds and stores the context from a remembered sign-in', async () => {
++    const { encryptSession } = await import('@/lib/auth/crypto');
++    const { restoreStalwartAuthContextFromSession, readStalwartAuthContextFromStore } = await import('@/lib/stalwart/auth-context');
++    jar.set('jmap_session_1', encryptSession('https://mail.example.com', 'me@example.com', 'pw'));
++
++    const context = restoreStalwartAuthContextFromSession(jar as never, 1);
++
++    const expected = {
++      serverUrl: 'https://mail.example.com',
++      username: 'me@example.com',
++      authHeader: `Basic ${Buffer.from('me@example.com:pw').toString('base64')}`,
++    };
++    expect(context).toEqual(expected);
++    // Stored, so the next request in this browser session needs no rebuild.
++    expect(readStalwartAuthContextFromStore(jar as never, 1)).toEqual(expected);
++  });
++
++  it('returns null, and stores nothing, without a remembered sign-in', async () => {
++    const { restoreStalwartAuthContextFromSession } = await import('@/lib/stalwart/auth-context');
++    expect(restoreStalwartAuthContextFromSession(jar as never, 0)).toBeNull();
++    expect(jar.store.size).toBe(0);
++  });
++
++  it('returns null, and stores nothing, for a remembered sign-in that will not open', async () => {
++    const { restoreStalwartAuthContextFromSession } = await import('@/lib/stalwart/auth-context');
++    jar.set('jmap_session', 'bm90LWEtc2Vzc2lvbi10b2tlbi1hdC1hbGwtcmVhbGx5LW5vdA==');
++    expect(restoreStalwartAuthContextFromSession(jar as never, 0)).toBeNull();
++    expect([...jar.store.keys()]).toEqual(['jmap_session']);
++  });
++});
+diff --git a/lib/__tests__/push-preview-route.test.ts b/lib/__tests__/push-preview-route.test.ts
+index 89de1cc..2b5c4aa 100644
+--- a/lib/__tests__/push-preview-route.test.ts
++++ b/lib/__tests__/push-preview-route.test.ts
+@@ -28,11 +28,13 @@ vi.mock('@/lib/account-utils', () => ({ MAX_ACCOUNT_SLOTS: 2 }));
+ 
+ let storedAuthHeader = 'Bearer tok';
+ let hasContext = true;
++let restored: Record<string, string> | null = null;
+ const setStalwartAuthContextInStore = vi.fn();
+ vi.mock('@/lib/stalwart/auth-context', () => ({
+   readStalwartAuthContextFromStore: (_store: unknown, slot: number) =>
+     slot === 0 && hasContext ? { serverUrl: 'https://mail.example.com/', username: 'me', authHeader: storedAuthHeader } : null,
+   setStalwartAuthContextInStore: (...args: unknown[]) => setStalwartAuthContextInStore(...args),
++  restoreStalwartAuthContextFromSession: () => restored,
+ }));
+ 
+ const readRefreshToken = vi.fn();
+@@ -148,6 +150,7 @@ describe('push preview route after the session token expired', () => {
+     vi.clearAllMocks();
+     storedAuthHeader = 'Bearer expired';
+     hasContext = true;
++    restored = null;
+     mockJmap('Bearer fresh');
+     readRefreshToken.mockReturnValue({ refreshToken: 'rt1', serverId: null });
+     requestTokenRefresh.mockResolvedValue({ ok: true, tokens: RENEWED });
+@@ -216,6 +219,19 @@ describe('push preview route after the session token expired', () => {
+     expect(warn).toHaveBeenCalledWith('push preview found an expired session token and no refresh token', { slot: 0 });
+   });
+ 
++  it('rebuilds a dropped context from the remembered sign-in and answers with the preview', async () => {
++    // The phone's browser restarted in the background: the 30-day remembered
++    // sign-in survived, the session-scoped context did not.
++    hasContext = false;
++    restored = { serverUrl: 'https://mail.example.com/', username: 'me', authHeader: 'Basic bWU6cHc=' };
++    mockJmap('Basic bWU6cHc=');
++    const { status, body } = await callRoute('a');
++
++    expect(status).toBe(200);
++    expect(body.email).toMatchObject({ id: 'e1', subject: 'Hi' });
++    expect(requestTokenRefresh).not.toHaveBeenCalled();
++  });
++
+   it('says which cookies arrived when no session context did, by name only', async () => {
+     hasContext = false;
+     const { status } = await callRoute('a');
+diff --git a/lib/stalwart/auth-context.ts b/lib/stalwart/auth-context.ts
+index 38505b6..151a4d9 100644
+--- a/lib/stalwart/auth-context.ts
++++ b/lib/stalwart/auth-context.ts
+@@ -1,5 +1,6 @@
+ import { cookies } from 'next/headers';
+-import { decryptPayload, encryptPayload } from '@/lib/auth/crypto';
++import { decryptPayload, decryptSession, encryptPayload } from '@/lib/auth/crypto';
++import { sessionCookieName } from '@/lib/auth/session-cookie';
+ import { getCookieOptions } from '@/lib/oauth/cookie-config';
+ 
+ const STALWART_AUTH_CONTEXT_COOKIE = 'jmap_stalwart_ctx';
+@@ -80,6 +81,30 @@ export function setStalwartAuthContextInStore(
+   );
+ }
+ 
++/**
++ * Rebuild a slot's context from its remembered sign-in (the 30-day session
++ * cookie a "remember me" login keeps), and store it. The context cookie ends
++ * with the browser session, so a browser restarted in the background - a push
++ * waking a phone - comes back with the remembered sign-in but no context.
++ * Returns null when there is no remembered sign-in or it will not open.
++ */
++export function restoreStalwartAuthContextFromSession(
++  cookieStore: CookieStore,
++  slot: number,
++): StalwartAuthContext | null {
++  const token = cookieStore.get(sessionCookieName(slot))?.value;
++  if (!token) return null;
++  const credentials = decryptSession(token);
++  if (!credentials) return null;
++  const context = {
++    serverUrl: credentials.serverUrl,
++    username: credentials.username,
++    authHeader: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`,
++  };
++  setStalwartAuthContextInStore(cookieStore, slot, context);
++  return context;
++}
++
+ export async function setStalwartAuthContext(slot: number, context: StalwartAuthContext): Promise<void> {
+   const cookieStore = await cookies();
+   setStalwartAuthContextInStore(cookieStore, slot, context);
