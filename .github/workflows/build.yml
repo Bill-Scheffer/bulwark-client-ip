@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with three patches:
+# Builds Bulwark from its own release source with four patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -11,6 +11,9 @@
 #     token with the session's refresh token, as the open app does, so a notification still names the
 #     sender and subject when the app has not been open for an hour. Without it, every notification
 #     after the token's lifetime reads "You have new mail".
+#   0004-notification-badge.patch: the notification badge (Android's status-bar icon) can have its own
+#     image (PWA_BADGE_URL). Android draws the badge from its alpha channel alone, so an opaque PWA icon
+#     is a solid square there; the icon itself stays opaque, because it is also the maskable icon.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -34,7 +37,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.4
+  VERSION: 1.11.2-clientip.5
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -68,14 +71,17 @@ jobs:
         run: |
           set -eu
           for p in ../patch/patches/0001-forward-client-ip-to-jmap.patch ../patch/patches/0002-push-relay-build-arg.patch \
-                   ../patch/patches/0003-push-preview-renews-expired-session.patch; do
+                   ../patch/patches/0003-push-preview-renews-expired-session.patch \
+                   ../patch/patches/0004-notification-badge.patch; do
             git apply --check "$p"
             git apply "$p"
           done
           got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
           want=$(printf '%s\n' ' M Dockerfile' ' M instrumentation.node.ts' '?? lib/__tests__/jmap-upstream-fetch.test.ts' '?? lib/server/' \
             ' M app/api/auth/token/route.ts' ' M app/api/push/preview/route.ts' ' M lib/__tests__/push-preview-route.test.ts' \
-            '?? lib/oauth/refresh-slot.ts' '?? lib/__tests__/refresh-slot.test.ts' | LC_ALL=C sort | tr '\n' '|')
+            '?? lib/oauth/refresh-slot.ts' '?? lib/__tests__/refresh-slot.test.ts' \
+            ' M .env.example' ' M app/api/pwa-icon/[size]/route.ts' ' M lib/admin/types.ts' ' M public/sw.js' \
+            '?? lib/__tests__/pwa-icon-badge.test.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
@@ -88,7 +94,8 @@ jobs:
           set -eu
           npm ci --no-audit --no-fund --ignore-scripts
           npx vitest run lib/__tests__/jmap-upstream-fetch.test.ts lib/__tests__/push-preview-route.test.ts lib/__tests__/refresh-slot.test.ts \
-            lib/__tests__/oauth-token-route.test.ts lib/__tests__/auth-routes-same-origin.test.ts
+            lib/__tests__/oauth-token-route.test.ts lib/__tests__/auth-routes-same-origin.test.ts \
+            lib/__tests__/pwa-icon-badge.test.ts lib/__tests__/domain-branding.test.ts lib/__tests__/branding-asset.test.ts
           npx tsc --noEmit -p tsconfig.json
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
@@ -110,7 +117,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
-            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP, ${{ env.PUSH_RELAY_URL }} as its push relay, and push previews that renew an expired session
+            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP, ${{ env.PUSH_RELAY_URL }} as its push relay, push previews that renew an expired session, and a notification badge of its own
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -120,6 +127,9 @@ jobs:
 
       - name: End-to-end, a real Stalwart - the push preview after the access token expired
         run: bash patch/scripts/e2e-preview-renewal.sh "${IMAGE}:${VERSION}"
+
+      - name: End-to-end, the notification badge has its own image
+        run: bash patch/scripts/e2e-badge.sh "${IMAGE}:${VERSION}"
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:

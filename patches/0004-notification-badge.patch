@@ -1,0 +1,140 @@
+diff --git a/.env.example b/.env.example
+index 14a59e6..7634bb1 100644
+--- a/.env.example
++++ b/.env.example
+@@ -236,6 +236,9 @@ JMAP_SERVER_URL=https://your-jmap-server.com
+ # Can be an absolute URL (https://...) or a path relative to the public/ directory.
+ # Falls back to FAVICON_URL if not set, and to the default Bulwark icons if neither is set.
+ # PWA_ICON_URL=/branding/my-icon.svg
++# Notification badge (Android's status-bar icon). Android draws only its alpha channel,
++# so use a transparent silhouette; falls back to the PWA icon.
++# PWA_BADGE_URL=/branding/my-badge.png
+ 
+ # ---------------------------------------------------------------------------
+ # PWA appearance
+diff --git a/app/api/pwa-icon/[size]/route.ts b/app/api/pwa-icon/[size]/route.ts
+index 9f99e1a..9b2b014 100644
+--- a/app/api/pwa-icon/[size]/route.ts
++++ b/app/api/pwa-icon/[size]/route.ts
+@@ -32,7 +32,14 @@ export async function GET(
+     parseDomainBranding(configManager.get<unknown>('domainBranding', [])),
+   );
+   const sources = configManager.getAllWithSources();
++  // ?purpose=badge: the notification badge, which Android renders from the
++  // alpha channel alone. A configured badge wins; otherwise the icon below.
++  const badgeUrl =
++    req.nextUrl.searchParams.get('purpose') === 'badge' && sources.pwaBadgeUrl?.source !== 'default'
++      ? (sources.pwaBadgeUrl?.value as string)
++      : '';
+   const iconUrl =
++    badgeUrl ||
+     domainOverrides.pwaIconUrl ||
+     domainOverrides.faviconUrl ||
+     (sources.pwaIconUrl?.source !== 'default' ? (sources.pwaIconUrl?.value as string) : '') ||
+diff --git a/lib/__tests__/pwa-icon-badge.test.ts b/lib/__tests__/pwa-icon-badge.test.ts
+new file mode 100644
+index 0000000..20e76b2
+--- /dev/null
++++ b/lib/__tests__/pwa-icon-badge.test.ts
+@@ -0,0 +1,64 @@
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++import sharp from 'sharp';
++
++vi.mock('next/server', () => ({
++  NextResponse: class {
++    status: number;
++    constructor(_body: unknown, init?: { status?: number }) {
++      this.status = init?.status ?? 200;
++    }
++  },
++}));
++
++let env: Record<string, { value: unknown; source: 'admin' | 'env' | 'default' }> = {};
++vi.mock('@/lib/admin/config-manager', () => ({
++  configManager: {
++    ensureLoaded: async () => {},
++    get: (_key: string, fallback?: unknown) => fallback,
++    getAllWithSources: () => env,
++  },
++}));
++
++const fetchBrandingAsset = vi.fn();
++vi.mock('@/lib/admin/branding-asset', () => ({
++  fetchBrandingAsset: (...args: unknown[]) => fetchBrandingAsset(...args),
++}));
++
++function setting(value: string) {
++  return { value, source: 'env' as const };
++}
++
++async function iconSource(purpose: string | null) {
++  const { GET } = await import('@/app/api/pwa-icon/[size]/route');
++  const req = {
++    headers: { get: () => 'mail.example.com' },
++    nextUrl: { searchParams: { get: (k: string) => (k === 'purpose' ? purpose : null) }, hostname: 'mail.example.com' },
++  };
++  const res = await GET(req as never, { params: Promise.resolve({ size: '192' }) });
++  expect(res.status).toBe(200);
++  return fetchBrandingAsset.mock.calls.at(-1)?.[0];
++}
++
++describe('pwa-icon ?purpose=badge', () => {
++  beforeEach(async () => {
++    fetchBrandingAsset.mockReset();
++    fetchBrandingAsset.mockResolvedValue(
++      await sharp({ create: { width: 8, height: 8, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } }).png().toBuffer(),
++    );
++  });
++
++  it('serves the configured badge for the badge', async () => {
++    env = { pwaIconUrl: setting('/icon-a.webp'), pwaBadgeUrl: setting('/badge-a.webp') };
++    expect(await iconSource('badge')).toBe('/badge-a.webp');
++  });
++
++  it('serves the icon, not the badge, without ?purpose=badge', async () => {
++    env = { pwaIconUrl: setting('/icon-b.webp'), pwaBadgeUrl: setting('/badge-b.webp') };
++    expect(await iconSource(null)).toBe('/icon-b.webp');
++  });
++
++  it('falls back to the icon when no badge is configured', async () => {
++    env = { pwaIconUrl: setting('/icon-c.webp'), pwaBadgeUrl: { value: '', source: 'default' } };
++    expect(await iconSource('badge')).toBe('/icon-c.webp');
++  });
++});
+diff --git a/lib/admin/types.ts b/lib/admin/types.ts
+index bb4c952..d8a48d7 100644
+--- a/lib/admin/types.ts
++++ b/lib/admin/types.ts
+@@ -203,6 +203,10 @@ export const CONFIG_ENV_MAP: Record<string, { envVar: string; fileEnvVar?: strin
+   devMode: { envVar: 'DEV_MOCK_JMAP', type: 'boolean', defaultValue: false },
+   faviconUrl: { envVar: 'FAVICON_URL', type: 'url', defaultValue: '/branding/Bulwark_Favicon.svg' },
+   pwaIconUrl: { envVar: 'PWA_ICON_URL', type: 'url', defaultValue: '' },
++  // The notification badge (Android's status-bar icon). Android draws only its
++  // alpha channel, so an opaque PWA icon becomes a solid square there; this is
++  // a transparent silhouette instead. Unset, the badge is the PWA icon.
++  pwaBadgeUrl: { envVar: 'PWA_BADGE_URL', type: 'url', defaultValue: '' },
+   pwaScreenshotMobileUrl: { envVar: 'PWA_SCREENSHOT_MOBILE_URL', type: 'url', defaultValue: '' },
+   pwaScreenshotDesktopUrl: { envVar: 'PWA_SCREENSHOT_DESKTOP_URL', type: 'url', defaultValue: '' },
+   pwaThemeColor: { envVar: 'PWA_THEME_COLOR', type: 'string', defaultValue: '#ffffff' },
+diff --git a/public/sw.js b/public/sw.js
+index 7d31d60..631924b 100644
+--- a/public/sw.js
++++ b/public/sw.js
+@@ -214,7 +214,7 @@ async function handlePush(event) {
+     // Branded app icon via the PWA-icon endpoint (admin-configured, else the
+     // built-in default). The static /icon-192x192.png ignored admin branding.
+     icon: `${BASE_PATH}/api/pwa-icon/192`,
+-    badge: `${BASE_PATH}/api/pwa-icon/192`,
++    badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`,
+     data,
+     renotify: true,
+   });
+@@ -389,7 +389,7 @@ async function showMailtoFocusNotification(state) {
+       body: state.focusNotificationBody || "The request was opened in Bulwark. Click to bring it to the front.",
+       tag: "bulwark-mailto-focus",
+       icon: `${BASE_PATH}/api/pwa-icon/192`,
+-      badge: `${BASE_PATH}/api/pwa-icon/192`,
++      badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`,
+       data: { kind: "protocol-mailto-focus" },
+       renotify: true,
+     });

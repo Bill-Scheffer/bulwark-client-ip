@@ -51,6 +51,18 @@ only once the retry has worked. Three rules keep it safe:
   renewal decides what the failure means.
 - A `Basic` credential never triggers a refresh.
 
+## The notification badge
+
+[`patches/0004-notification-badge.patch`](patches/0004-notification-badge.patch). A notification
+carries two images: the icon, and the badge Android shows in the status bar. Bulwark used the PWA
+icon for both. Android draws the badge from its alpha channel alone, so an icon with an opaque
+background (which a maskable icon must have, and the manifest offers the PWA icon as maskable) shows
+as a solid square. `PWA_BADGE_URL` names a separate image, a transparent silhouette; the service
+worker asks for `/api/pwa-icon/192?purpose=badge`, which serves it, and falls back to the PWA icon
+when it is unset. [`scripts/e2e-badge.sh`](scripts/e2e-badge.sh) checks the built image: with it set
+the badge is its own image and the icon is unchanged, the shipped service worker asks for the badge
+URL, and without it the badge is the icon. Against `clientip.4` it fails.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
