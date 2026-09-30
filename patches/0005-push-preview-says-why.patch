@@ -1,0 +1,135 @@
+diff --git a/app/api/push/preview/route.ts b/app/api/push/preview/route.ts
+index ed4f85d..3dfdd24 100644
+--- a/app/api/push/preview/route.ts
++++ b/app/api/push/preview/route.ts
+@@ -49,7 +49,10 @@ type CookieStore = Awaited<ReturnType<typeof cookies>>;
+  */
+ async function renewBearer(cookieStore: CookieStore, slot: number): Promise<RefreshedTokens | null> {
+   const stored = readRefreshToken(cookieStore, slot);
+-  if (!stored) return null;
++  if (!stored) {
++    logger.warn('push preview found an expired session token and no refresh token', { slot });
++    return null;
++  }
+   const outcome = await requestTokenRefresh(stored.refreshToken, stored.serverId);
+   if (!outcome.ok) {
+     logger.warn('push preview could not renew an expired session token', { slot, reason: outcome.reason });
+@@ -87,13 +90,23 @@ async function resolveTargetForAccount(
+             if (!renewed) return null;
+             authHeader = `Bearer ${renewed.access_token}`;
+             res = await probe(authHeader);
+-            if (!res.ok) return null;
++            if (!res.ok) {
++              logger.warn('push preview renewed a session token the server then refused', { slot, status: res.status });
++              return null;
++            }
+             // Stored only once the new token has worked, so the open app
+             // resumes with it and the next preview needs no refresh.
+             storeRefreshedTokens(cookieStore, slot, renewed, basePath);
+             setStalwartAuthContextInStore(cookieStore, slot, { ...ctx, authHeader });
+           }
+-          if (!res.ok) return null;
++          if (!res.ok) {
++            logger.warn('push preview could not open the session', {
++              slot,
++              status: res.status,
++              scheme: authHeader.split(' ', 1)[0],
++            });
++            return null;
++          }
+           const session = (await res.json()) as {
+             apiUrl?: string;
+             primaryAccounts?: Record<string, string>;
+@@ -109,12 +122,22 @@ async function resolveTargetForAccount(
+             Object.prototype.hasOwnProperty.call(session.accounts ?? {}, accountId);
+           if (mailAccountId !== accountId && !isSharedAccount) return null;
+           return { authHeader, apiUrl: session.apiUrl, accountId, trusted, slot };
+-        } catch {
++        } catch (error) {
++          logger.warn('push preview session probe failed', {
++            slot,
++            error: error instanceof Error ? error.message : 'Unknown error',
++          });
+           return null;
+         }
+       })(),
+     );
+   }
++  if (probes.length === 0) {
++    // Names only, never values: which session cookies reached the route.
++    logger.warn('push preview found no session context', {
++      cookies: cookieStore.getAll().map((c) => c.name).sort(),
++    });
++  }
+   const results = await Promise.all(probes);
+   return results.find((r): r is ResolvedTarget => r !== null) ?? null;
+ }
+diff --git a/lib/__tests__/push-preview-route.test.ts b/lib/__tests__/push-preview-route.test.ts
+index ab15b35..89de1cc 100644
+--- a/lib/__tests__/push-preview-route.test.ts
++++ b/lib/__tests__/push-preview-route.test.ts
+@@ -9,22 +9,29 @@ vi.mock('next/server', () => ({
+   },
+ }));
+ 
+-const cookieStore = { get: () => undefined, set: vi.fn(), delete: vi.fn() };
++const cookieStore = {
++  get: () => undefined,
++  getAll: () => [{ name: 'jmap_rt', value: 'secret-refresh' }],
++  set: vi.fn(),
++  delete: vi.fn(),
++};
+ vi.mock('next/headers', () => ({
+   cookies: async () => cookieStore,
+ }));
+ 
++const warn = vi.fn();
+ vi.mock('@/lib/logger', () => ({
+-  logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn(), info: vi.fn() },
++  logger: { warn: (...args: unknown[]) => warn(...args), error: vi.fn(), debug: vi.fn(), info: vi.fn() },
+ }));
+ 
+ vi.mock('@/lib/account-utils', () => ({ MAX_ACCOUNT_SLOTS: 2 }));
+ 
+ let storedAuthHeader = 'Bearer tok';
++let hasContext = true;
+ const setStalwartAuthContextInStore = vi.fn();
+ vi.mock('@/lib/stalwart/auth-context', () => ({
+   readStalwartAuthContextFromStore: (_store: unknown, slot: number) =>
+-    slot === 0 ? { serverUrl: 'https://mail.example.com/', username: 'me', authHeader: storedAuthHeader } : null,
++    slot === 0 && hasContext ? { serverUrl: 'https://mail.example.com/', username: 'me', authHeader: storedAuthHeader } : null,
+   setStalwartAuthContextInStore: (...args: unknown[]) => setStalwartAuthContextInStore(...args),
+ }));
+ 
+@@ -140,6 +147,7 @@ describe('push preview route after the session token expired', () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
+     storedAuthHeader = 'Bearer expired';
++    hasContext = true;
+     mockJmap('Bearer fresh');
+     readRefreshToken.mockReturnValue({ refreshToken: 'rt1', serverId: null });
+     requestTokenRefresh.mockResolvedValue({ ok: true, tokens: RENEWED });
+@@ -199,12 +207,22 @@ describe('push preview route after the session token expired', () => {
+     expect(setStalwartAuthContextInStore).not.toHaveBeenCalled();
+   });
+ 
+-  it('answers 401 without trying when the slot has no refresh token', async () => {
++  it('answers 401 without trying when the slot has no refresh token, and says so', async () => {
+     readRefreshToken.mockReturnValue(null);
+     const { status } = await callRoute('a');
+ 
+     expect(status).toBe(401);
+     expect(requestTokenRefresh).not.toHaveBeenCalled();
++    expect(warn).toHaveBeenCalledWith('push preview found an expired session token and no refresh token', { slot: 0 });
++  });
++
++  it('says which cookies arrived when no session context did, by name only', async () => {
++    hasContext = false;
++    const { status } = await callRoute('a');
++
++    expect(status).toBe(401);
++    expect(warn).toHaveBeenCalledWith('push preview found no session context', { cookies: ['jmap_rt'] });
++    expect(JSON.stringify(warn.mock.calls)).not.toContain('secret-refresh');
+   });
+ 
+   it('never refreshes for a Basic credential', async () => {

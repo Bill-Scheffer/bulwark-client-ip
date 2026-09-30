@@ -63,6 +63,14 @@ when it is unset. [`scripts/e2e-badge.sh`](scripts/e2e-badge.sh) checks the buil
 the badge is its own image and the icon is unchanged, the shipped service worker asks for the badge
 URL, and without it the badge is the icon. Against `clientip.4` it fails.
 
+## Why a preview failed
+
+[`patches/0005-push-preview-says-why.patch`](patches/0005-push-preview-says-why.patch). The preview
+route answered 401 on several paths without a word, so a generic notification could not be traced:
+no session context at all, an expired token with no refresh token, a renewed token the server then
+refused, a session that would not open, a probe that threw. Each now logs one warning with the slot
+and reason, never a value; the no-session one lists the NAMES of the cookies that arrived.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

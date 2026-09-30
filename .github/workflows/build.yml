@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with four patches:
+# Builds Bulwark from its own release source with five patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -14,6 +14,9 @@
 #   0004-notification-badge.patch: the notification badge (Android's status-bar icon) can have its own
 #     image (PWA_BADGE_URL). Android draws the badge from its alpha channel alone, so an opaque PWA icon
 #     is a solid square there; the icon itself stays opaque, because it is also the maskable icon.
+#   0005-push-preview-says-why.patch: the push preview logs a warning on each path that answers 401
+#     (never a value; the no-session case names which cookies arrived), so a generic notification
+#     can be traced to its cause.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -37,7 +40,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.5
+  VERSION: 1.11.2-clientip.6
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -72,7 +75,8 @@ jobs:
           set -eu
           for p in ../patch/patches/0001-forward-client-ip-to-jmap.patch ../patch/patches/0002-push-relay-build-arg.patch \
                    ../patch/patches/0003-push-preview-renews-expired-session.patch \
-                   ../patch/patches/0004-notification-badge.patch; do
+                   ../patch/patches/0004-notification-badge.patch \
+                   ../patch/patches/0005-push-preview-says-why.patch; do
             git apply --check "$p"
             git apply "$p"
           done
