@@ -32,14 +32,44 @@ guarded fetch path), are unchanged. Unset, the image behaves exactly like upstre
 must trust `X-Forwarded-For` from this app (Stalwart: `useXForwarded`) and be reachable only by peers
 that cannot forge it.
 
+## Push previews after the session expires
+
+[`patches/0003-push-preview-renews-expired-session.patch`](patches/0003-push-preview-renews-expired-session.patch).
+When a push arrives, the service worker asks `/api/push/preview` for the new message's sender and
+subject. That route calls the JMAP server with the credential saved in the session. For a password or
+OAuth sign-in the credential is an OAuth access token, and only the **open app** renews it. Stalwart's
+tokens last an hour, so an hour after the app was last open every notification reads
+"You have new mail": the preview gets a 401 and the worker falls back to generic text.
+
+With the patch, when that credential is a `Bearer` token and the JMAP server answers 401, the route
+spends the session's refresh token (the exchange `PUT /api/auth/token` already makes for the app, now
+one shared function in `lib/oauth/refresh-slot.ts`), retries, and stores the new token and session
+only once the retry has worked. Three rules keep it safe:
+
+- Two previews for one delivery share **one** refresh, keyed by the refresh token.
+- A failed refresh here **deletes nothing**. The preview answers 401 as before, and the app's own
+  renewal decides what the failure means.
+- A `Basic` credential never triggers a refresh.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
 tests and the typecheck; and it runs [`scripts/e2e.sh`](scripts/e2e.sh) against the **built image**
 (a stub stands in for the JMAP server): the pre-check must reach the internal URL carrying the
 visitor's IP, and the same image without the variables must not reach it at all. Only then is the
-image pushed. Upstream's full suite passes with the patch applied except two tests that fail on
-unpatched 1.11.2 too (`health-route`, `idn`).
+image pushed.
+
+For 0003, the workflow also runs the preview and token routes' suites, and
+[`scripts/e2e-preview-renewal.sh`](scripts/e2e-preview-renewal.sh): a real Stalwart with 20-second
+access tokens and the built image. A real password sign-in and the app's session sync, then previews:
+across an expiry (two at once), across a second expiry with the cookies the first renewal stored, and
+without a refresh token (401, and no cookie changed). The script's negative control (`401`) run
+against the image before this patch (`clientip.3`) reproduces the failure: 200 while the token is
+fresh, 401 after.
+
+Upstream's full suite passes with the patches applied except tests that fail on unpatched 1.11.2
+too: `health-route` and `idn` when 0001 was measured, and `health-route` and `birthday-calendar` (on a
+Node 22 host) when 0003 was.
 
 Image: `ghcr.io/bill-scheffer/bulwark-client-ip:<bulwark tag>-clientip.N`. Pin it by digest.
 

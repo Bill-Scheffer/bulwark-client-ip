@@ -1,0 +1,625 @@
+diff --git a/app/api/auth/token/route.ts b/app/api/auth/token/route.ts
+index 239739a..ee6ef81 100644
+--- a/app/api/auth/token/route.ts
++++ b/app/api/auth/token/route.ts
+@@ -5,7 +5,6 @@ import {
+   refreshTokenCookieName,
+   refreshTokenServerCookieName,
+   accessTokenCookieName,
+-  encodeCachedAccessToken,
+   decodeCachedAccessToken,
+ } from '@/lib/oauth/tokens';
+ import {
+@@ -13,9 +12,14 @@ import {
+   buildOAuthParams,
+   getMetadata,
+   getRequiredConfig,
+-  getTokenEndpoint,
+   DEFAULT_CLIENT_ID,
+ } from '@/lib/oauth/token-exchange';
++import {
++  cacheAccessToken,
++  readRefreshToken,
++  requestTokenRefresh,
++  storeRefreshedTokens,
++} from '@/lib/oauth/refresh-slot';
+ import type { OAuthMetadata } from '@/lib/oauth/discovery';
+ import { getCookieOptions } from '@/lib/oauth/cookie-config';
+ import {
+@@ -88,30 +92,6 @@ function endSessionUrlFor(metadata: OAuthMetadata | null, serverId: string | nul
+ 
+ type CookieStore = Awaited<ReturnType<typeof cookies>>;
+ 
+-/**
+- * Cache the access token for the slot so a page reload can resume with it.
+- *
+- * Scoped to the token's own lifetime - once it expires the cookie is worthless
+- * and should not linger. A token too large to store is simply not cached.
+- * Returns the cookie value written, or null.
+- */
+-function cacheAccessToken(
+-  cookieStore: CookieStore,
+-  slot: number,
+-  accessToken: string,
+-  expiresIn: number,
+-): string | null {
+-  const name = accessTokenCookieName(slot);
+-  const value = encodeCachedAccessToken(accessToken, expiresIn);
+-  if (!value) {
+-    // Oversized token: drop any stale entry rather than leaving a mismatch.
+-    cookieStore.delete(name);
+-    return null;
+-  }
+-  cookieStore.set(name, value, { ...getCookieOptions(), maxAge: expiresIn });
+-  return value;
+-}
+-
+ export async function POST(request: NextRequest) {
+   // CSRF gate (GHSA-qvr9-m8cq-7wvg): cookies written here are SameSite=Lax,
+   // so a cross-site top-level POST would otherwise reach this handler.
+@@ -165,12 +145,10 @@ export async function PUT(request: NextRequest) {
+   if (crossOrigin) return crossOrigin;
+   try {
+     const slot = getSlot(request);
+-    const cookieName = refreshTokenCookieName(slot);
+     const cookieStore = await cookies();
+-    const refreshToken = cookieStore.get(cookieName)?.value;
+-    const serverId = cookieStore.get(refreshTokenServerCookieName(slot))?.value || null;
++    const stored = readRefreshToken(cookieStore, slot);
+ 
+-    if (!refreshToken) {
++    if (!stored) {
+       cookieStore.delete(accessTokenCookieName(slot));
+       return NextResponse.json({ error: 'No refresh token' }, { status: 401 });
+     }
+@@ -194,63 +172,29 @@ export async function PUT(request: NextRequest) {
+       }
+     }
+ 
+-    // The refresh token may have been minted by the password+TOTP login route,
+-    // which works without a configured OAuth client by falling back to the
+-    // default client id - refreshing must fall back the same way (#873).
+-    const tokenEndpoint = await getTokenEndpoint(serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
+-
+-    const params = buildOAuthParams({
+-      grant_type: 'refresh_token',
+-      refresh_token: refreshToken,
+-    }, serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
+-
+-    const tokenResponse = await fetch(tokenEndpoint, {
+-      method: 'POST',
+-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+-      body: params.toString(),
+-      // See revokeRefreshToken: the body holds the refresh token.
+-      redirect: 'error',
+-    });
+-
+-    if (!tokenResponse.ok) {
+-      const errorText = await tokenResponse.text();
+-      logger.error('Token refresh failed', { status: tokenResponse.status, error: errorText });
++    const outcome = await requestTokenRefresh(stored.refreshToken, stored.serverId);
++    if (!outcome.ok) {
+       // Drop the refresh token only when the server definitively rejected it
+       // (invalid/expired/revoked grant). A 5xx or 429 is an outage - keeping
+       // the cookie lets the session resume once the server is back.
+-      const status = tokenResponse.status;
+-      if (status === 400 || status === 401 || status === 403) {
+-        cookieStore.delete(cookieName);
++      if (outcome.reason === 'rejected') {
++        cookieStore.delete(refreshTokenCookieName(slot));
+         cookieStore.delete(refreshTokenServerCookieName(slot));
+         cookieStore.delete(accessTokenCookieName(slot));
+         clearIdToken(cookieStore, slot, request.nextUrl.basePath);
+         return NextResponse.json({ error: 'Refresh failed' }, { status: 401 });
+       }
+-      return NextResponse.json({ error: 'Token endpoint unavailable' }, { status: 503 });
+-    }
+-
+-    const tokens = await tokenResponse.json();
+-
+-    if (!tokens.access_token) {
+-      logger.error('Refresh response missing access_token', { response: JSON.stringify(tokens).substring(0, 500) });
++      if (outcome.reason === 'unavailable') {
++        return NextResponse.json({ error: 'Token endpoint unavailable' }, { status: 503 });
++      }
+       return NextResponse.json({ error: 'Invalid token response' }, { status: 502 });
+     }
+ 
+-    if (tokens.refresh_token) {
+-      cookieStore.set(cookieName, tokens.refresh_token, getCookieOptions());
+-    }
+-
+-    const expiresIn = tokens.expires_in || 3600;
+-    const cachedAccessToken = cacheAccessToken(cookieStore, slot, tokens.access_token, expiresIn);
+-    // Providers may reissue the id token on refresh. Only a slot signed in
+-    // through the provider keeps one; a password login's slot gains none here.
+-    if (typeof tokens.id_token === 'string' && cookieStore.get(idTokenCookieName(slot))) {
+-      storeIdToken(cookieStore, slot, tokens.id_token, request.nextUrl.basePath, [tokens.refresh_token, cachedAccessToken]);
+-    }
++    storeRefreshedTokens(cookieStore, slot, outcome.tokens, request.nextUrl.basePath);
+ 
+     return NextResponse.json({
+-      access_token: tokens.access_token,
+-      expires_in: expiresIn,
++      access_token: outcome.tokens.access_token,
++      expires_in: outcome.tokens.expires_in,
+     });
+   } catch (error) {
+     logger.error('Token refresh error', { error: error instanceof Error ? error.message : 'Unknown error' });
+diff --git a/app/api/push/preview/route.ts b/app/api/push/preview/route.ts
+index 17fcd19..ed4f85d 100644
+--- a/app/api/push/preview/route.ts
++++ b/app/api/push/preview/route.ts
+@@ -2,7 +2,16 @@ import { cookies } from 'next/headers';
+ import { NextRequest, NextResponse } from 'next/server';
+ import { logger } from '@/lib/logger';
+ import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
+-import { readStalwartAuthContextFromStore } from '@/lib/stalwart/auth-context';
++import {
++  readStalwartAuthContextFromStore,
++  setStalwartAuthContextInStore,
++} from '@/lib/stalwart/auth-context';
++import {
++  readRefreshToken,
++  requestTokenRefresh,
++  storeRefreshedTokens,
++  type RefreshedTokens,
++} from '@/lib/oauth/refresh-slot';
+ import {
+   getStalwartCredentials,
+   type StalwartCredentials,
+@@ -27,11 +36,36 @@ interface ResolvedTarget {
+   slot?: number;
+ }
+ 
++type CookieStore = Awaited<ReturnType<typeof cookies>>;
++
++/**
++ * The session's access token expired, which it does after about an hour
++ * whenever the app is not open to renew it - exactly when push previews
++ * matter. Spend the slot's refresh token for a new one, the same exchange
++ * PUT /api/auth/token makes for the open app.
++ *
++ * A failed refresh here deletes nothing: the worker then shows its generic
++ * notification, and the app's own renewal decides what the failure means.
++ */
++async function renewBearer(cookieStore: CookieStore, slot: number): Promise<RefreshedTokens | null> {
++  const stored = readRefreshToken(cookieStore, slot);
++  if (!stored) return null;
++  const outcome = await requestTokenRefresh(stored.refreshToken, stored.serverId);
++  if (!outcome.ok) {
++    logger.warn('push preview could not renew an expired session token', { slot, reason: outcome.reason });
++    return null;
++  }
++  return outcome.tokens;
++}
++
+ // When the SW passes ?accountId=, we need the slot whose JMAP session owns
+ // that account - not just "the first signed-in slot", which is what
+ // getStalwartCredentials() defaults to. Probe each candidate's session in
+ // parallel and return the first match.
+-async function resolveTargetForAccount(accountId: string): Promise<ResolvedTarget | null> {
++async function resolveTargetForAccount(
++  accountId: string,
++  basePath: string | undefined,
++): Promise<ResolvedTarget | null> {
+   const cookieStore = await cookies();
+   const probes: Promise<ResolvedTarget | null>[] = [];
+   for (let slot = 0; slot < MAX_ACCOUNT_SLOTS; slot++) {
+@@ -42,9 +76,23 @@ async function resolveTargetForAccount(accountId: string): Promise<ResolvedTarge
+       (async () => {
+         try {
+           const trusted = await isTrustedJmapServerUrl(serverUrl);
+-          const res = await fetchJmapServer(`${serverUrl}/.well-known/jmap`, {
+-            headers: { Authorization: ctx.authHeader },
++          const probe = (authHeader: string) => fetchJmapServer(`${serverUrl}/.well-known/jmap`, {
++            headers: { Authorization: authHeader },
+           }, trusted);
++          let authHeader = ctx.authHeader;
++          let res = await probe(authHeader);
++          // Only an OAuth session renews; a Basic credential does not expire.
++          if (res.status === 401 && authHeader.startsWith('Bearer ')) {
++            const renewed = await renewBearer(cookieStore, slot);
++            if (!renewed) return null;
++            authHeader = `Bearer ${renewed.access_token}`;
++            res = await probe(authHeader);
++            if (!res.ok) return null;
++            // Stored only once the new token has worked, so the open app
++            // resumes with it and the next preview needs no refresh.
++            storeRefreshedTokens(cookieStore, slot, renewed, basePath);
++            setStalwartAuthContextInStore(cookieStore, slot, { ...ctx, authHeader });
++          }
+           if (!res.ok) return null;
+           const session = (await res.json()) as {
+             apiUrl?: string;
+@@ -60,7 +108,7 @@ async function resolveTargetForAccount(accountId: string): Promise<ResolvedTarge
+             accountId !== mailAccountId &&
+             Object.prototype.hasOwnProperty.call(session.accounts ?? {}, accountId);
+           if (mailAccountId !== accountId && !isSharedAccount) return null;
+-          return { authHeader: ctx.authHeader, apiUrl: session.apiUrl, accountId, trusted, slot };
++          return { authHeader, apiUrl: session.apiUrl, accountId, trusted, slot };
+         } catch {
+           return null;
+         }
+@@ -114,7 +162,7 @@ export async function GET(request: NextRequest) {
+     let target: ResolvedTarget | null = null;
+     let authHeader: string;
+     if (requestedAccountId) {
+-      target = await resolveTargetForAccount(requestedAccountId);
++      target = await resolveTargetForAccount(requestedAccountId, request.nextUrl.basePath);
+       if (!target) {
+         return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+       }
+diff --git a/lib/__tests__/push-preview-route.test.ts b/lib/__tests__/push-preview-route.test.ts
+index 3664c49..ab15b35 100644
+--- a/lib/__tests__/push-preview-route.test.ts
++++ b/lib/__tests__/push-preview-route.test.ts
+@@ -9,8 +9,9 @@ vi.mock('next/server', () => ({
+   },
+ }));
+ 
++const cookieStore = { get: () => undefined, set: vi.fn(), delete: vi.fn() };
+ vi.mock('next/headers', () => ({
+-  cookies: async () => ({ get: () => undefined }),
++  cookies: async () => cookieStore,
+ }));
+ 
+ vi.mock('@/lib/logger', () => ({
+@@ -19,9 +20,21 @@ vi.mock('@/lib/logger', () => ({
+ 
+ vi.mock('@/lib/account-utils', () => ({ MAX_ACCOUNT_SLOTS: 2 }));
+ 
++let storedAuthHeader = 'Bearer tok';
++const setStalwartAuthContextInStore = vi.fn();
+ vi.mock('@/lib/stalwart/auth-context', () => ({
+   readStalwartAuthContextFromStore: (_store: unknown, slot: number) =>
+-    slot === 0 ? { serverUrl: 'https://mail.example.com/', authHeader: 'Bearer tok' } : null,
++    slot === 0 ? { serverUrl: 'https://mail.example.com/', username: 'me', authHeader: storedAuthHeader } : null,
++  setStalwartAuthContextInStore: (...args: unknown[]) => setStalwartAuthContextInStore(...args),
++}));
++
++const readRefreshToken = vi.fn();
++const requestTokenRefresh = vi.fn();
++const storeRefreshedTokens = vi.fn();
++vi.mock('@/lib/oauth/refresh-slot', () => ({
++  readRefreshToken: (...args: unknown[]) => readRefreshToken(...args),
++  requestTokenRefresh: (...args: unknown[]) => requestTokenRefresh(...args),
++  storeRefreshedTokens: (...args: unknown[]) => storeRefreshedTokens(...args),
+ }));
+ 
+ vi.mock('@/lib/stalwart/credentials', () => ({
+@@ -48,8 +61,11 @@ const SESSION = {
+   accounts: { a: { name: 'me@example.com' }, g: { name: 'group@example.com' } },
+ };
+ 
+-function mockJmap() {
+-  fetchJmapServer.mockImplementation(async (url: string, init?: { body?: string }) => {
++// The JMAP server accepts only `validAuth`; anything else is a 401, as an
++// expired OAuth access token is.
++function mockJmap(validAuth = 'Bearer tok') {
++  fetchJmapServer.mockImplementation(async (url: string, init?: { body?: string; headers?: Record<string, string> }) => {
++    if (init?.headers?.Authorization !== validAuth) return { ok: false, status: 401, json: async () => ({}) };
+     if (url.endsWith('/.well-known/jmap')) return jsonResponse(SESSION);
+     const body = JSON.parse(init?.body ?? '{}') as { methodCalls: [string, Record<string, unknown>, string][] };
+     const first = body.methodCalls[0];
+@@ -80,6 +96,7 @@ async function callRoute(accountId: string) {
+ describe('push preview route account resolution', () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
++    storedAuthHeader = 'Bearer tok';
+     mockJmap();
+   });
+ 
+@@ -116,3 +133,95 @@ describe('push preview route account resolution', () => {
+     expect(status).toBe(401);
+   });
+ });
++
++describe('push preview route after the session token expired', () => {
++  const RENEWED = { access_token: 'fresh', expires_in: 3600, refresh_token: 'rt2' };
++
++  beforeEach(() => {
++    vi.clearAllMocks();
++    storedAuthHeader = 'Bearer expired';
++    mockJmap('Bearer fresh');
++    readRefreshToken.mockReturnValue({ refreshToken: 'rt1', serverId: null });
++    requestTokenRefresh.mockResolvedValue({ ok: true, tokens: RENEWED });
++  });
++
++  function authHeadersSent() {
++    return fetchJmapServer.mock.calls.map(([, init]) => (init as { headers: Record<string, string> }).headers.Authorization);
++  }
++
++  it('renews with the refresh token and answers with the preview', async () => {
++    const { status, body } = await callRoute('a');
++
++    expect(status).toBe(200);
++    expect(body.email).toMatchObject({ id: 'e1', subject: 'Hi' });
++    expect(requestTokenRefresh).toHaveBeenCalledWith('rt1', null);
++    // Everything after the refused probe carries the new token.
++    expect(authHeadersSent()).toEqual(['Bearer expired', 'Bearer fresh', 'Bearer fresh', 'Bearer fresh']);
++  });
++
++  it('stores the new token and session, so the next preview needs no refresh', async () => {
++    await callRoute('a');
++
++    expect(storeRefreshedTokens).toHaveBeenCalledWith(cookieStore, 0, RENEWED, undefined);
++    expect(setStalwartAuthContextInStore).toHaveBeenCalledWith(cookieStore, 0, {
++      serverUrl: 'https://mail.example.com/',
++      username: 'me',
++      authHeader: 'Bearer fresh',
++    });
++  });
++
++  it.each(['rejected', 'unavailable', 'invalid-response'])(
++    'answers 401 and deletes nothing when the refresh is %s',
++    async (reason) => {
++      requestTokenRefresh.mockResolvedValue({ ok: false, reason });
++      const { status } = await callRoute('a');
++
++      expect(status).toBe(401);
++      expect(cookieStore.delete).not.toHaveBeenCalled();
++      expect(storeRefreshedTokens).not.toHaveBeenCalled();
++      expect(setStalwartAuthContextInStore).not.toHaveBeenCalled();
++    },
++  );
++
++  it('answers 401 when the refresh throws', async () => {
++    requestTokenRefresh.mockRejectedValue(new Error('network down'));
++    const { status } = await callRoute('a');
++    expect(status).toBe(401);
++    expect(cookieStore.delete).not.toHaveBeenCalled();
++  });
++
++  it('stores nothing when the renewed token is refused too', async () => {
++    mockJmap('Bearer something-else');
++    const { status } = await callRoute('a');
++
++    expect(status).toBe(401);
++    expect(storeRefreshedTokens).not.toHaveBeenCalled();
++    expect(setStalwartAuthContextInStore).not.toHaveBeenCalled();
++  });
++
++  it('answers 401 without trying when the slot has no refresh token', async () => {
++    readRefreshToken.mockReturnValue(null);
++    const { status } = await callRoute('a');
++
++    expect(status).toBe(401);
++    expect(requestTokenRefresh).not.toHaveBeenCalled();
++  });
++
++  it('never refreshes for a Basic credential', async () => {
++    storedAuthHeader = 'Basic bWU6d3Jvbmc=';
++    const { status } = await callRoute('a');
++
++    expect(status).toBe(401);
++    expect(readRefreshToken).not.toHaveBeenCalled();
++    expect(requestTokenRefresh).not.toHaveBeenCalled();
++  });
++
++  it('does not refresh a token that is still good', async () => {
++    storedAuthHeader = 'Bearer fresh';
++    const { status } = await callRoute('a');
++
++    expect(status).toBe(200);
++    expect(requestTokenRefresh).not.toHaveBeenCalled();
++    expect(setStalwartAuthContextInStore).not.toHaveBeenCalled();
++  });
++});
+diff --git a/lib/__tests__/refresh-slot.test.ts b/lib/__tests__/refresh-slot.test.ts
+new file mode 100644
+index 0000000..30a97c4
+--- /dev/null
++++ b/lib/__tests__/refresh-slot.test.ts
+@@ -0,0 +1,64 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
++
++vi.mock('@/lib/logger', () => ({
++  logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn(), info: vi.fn() },
++}));
++
++vi.mock('@/lib/oauth/token-exchange', () => ({
++  getTokenEndpoint: async () => 'https://idp.example.com/token',
++  buildOAuthParams: (params: Record<string, string>) => new URLSearchParams(params),
++  DEFAULT_CLIENT_ID: 'bulwark-webmail',
++}));
++
++const fetchMock = vi.fn();
++
++describe('requestTokenRefresh', () => {
++  beforeEach(() => {
++    vi.stubGlobal('fetch', fetchMock);
++    fetchMock.mockReset();
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  function tokenResponse() {
++    return { ok: true, status: 200, json: async () => ({ access_token: 'fresh', expires_in: 60 }) };
++  }
++
++  it('spends a refresh token once for callers that arrive together', async () => {
++    const { requestTokenRefresh } = await import('@/lib/oauth/refresh-slot');
++    let release!: () => void;
++    fetchMock.mockImplementation(() => new Promise((resolve) => { release = () => resolve(tokenResponse()); }));
++
++    const both = Promise.all([requestTokenRefresh('rt1', null), requestTokenRefresh('rt1', null)]);
++    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
++    release();
++    const results = await both;
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(results.map((r) => r.ok)).toEqual([true, true]);
++  });
++
++  it('exchanges again once the earlier exchange has settled', async () => {
++    const { requestTokenRefresh } = await import('@/lib/oauth/refresh-slot');
++    fetchMock.mockResolvedValue(tokenResponse());
++
++    await requestTokenRefresh('rt1', null);
++    await requestTokenRefresh('rt1', null);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it('does not share an exchange between different refresh tokens', async () => {
++    const { requestTokenRefresh } = await import('@/lib/oauth/refresh-slot');
++    fetchMock.mockResolvedValue(tokenResponse());
++
++    await Promise.all([requestTokenRefresh('rt1', null), requestTokenRefresh('rt2', null)]);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it('lets the next caller try again after a failed exchange', async () => {
++    const { requestTokenRefresh } = await import('@/lib/oauth/refresh-slot');
++    fetchMock.mockRejectedValueOnce(new Error('network down')).mockResolvedValue(tokenResponse());
++
++    await expect(requestTokenRefresh('rt1', null)).rejects.toThrow('network down');
++    await expect(requestTokenRefresh('rt1', null)).resolves.toMatchObject({ ok: true });
++  });
++});
+diff --git a/lib/oauth/refresh-slot.ts b/lib/oauth/refresh-slot.ts
+new file mode 100644
+index 0000000..a1ffc42
+--- /dev/null
++++ b/lib/oauth/refresh-slot.ts
+@@ -0,0 +1,141 @@
++import type { cookies } from 'next/headers';
++import { logger } from '@/lib/logger';
++import {
++  refreshTokenCookieName,
++  refreshTokenServerCookieName,
++  accessTokenCookieName,
++  encodeCachedAccessToken,
++} from '@/lib/oauth/tokens';
++import { buildOAuthParams, getTokenEndpoint, DEFAULT_CLIENT_ID } from '@/lib/oauth/token-exchange';
++import { getCookieOptions } from '@/lib/oauth/cookie-config';
++import { idTokenCookieName, storeIdToken } from '@/lib/oauth/end-session';
++
++type CookieStore = Awaited<ReturnType<typeof cookies>>;
++
++export interface RefreshedTokens {
++  access_token: string;
++  expires_in: number;
++  refresh_token?: string;
++  id_token?: string;
++}
++
++/**
++ * The outcome of spending a refresh token. `rejected` means the server
++ * definitively refused the grant (400/401/403); `unavailable` is an outage
++ * (5xx, 429), after which the refresh token is still good.
++ */
++export type RefreshOutcome =
++  | { ok: true; tokens: RefreshedTokens }
++  | { ok: false; reason: 'rejected' | 'unavailable' | 'invalid-response' };
++
++/**
++ * Cache the access token for the slot so a page reload can resume with it.
++ *
++ * Scoped to the token's own lifetime - once it expires the cookie is worthless
++ * and should not linger. A token too large to store is simply not cached.
++ * Returns the cookie value written, or null.
++ */
++export function cacheAccessToken(
++  cookieStore: CookieStore,
++  slot: number,
++  accessToken: string,
++  expiresIn: number,
++): string | null {
++  const name = accessTokenCookieName(slot);
++  const value = encodeCachedAccessToken(accessToken, expiresIn);
++  if (!value) {
++    // Oversized token: drop any stale entry rather than leaving a mismatch.
++    cookieStore.delete(name);
++    return null;
++  }
++  cookieStore.set(name, value, { ...getCookieOptions(), maxAge: expiresIn });
++  return value;
++}
++
++// The open app and a push preview can find the same expired token at once,
++// and one delivery often brings two pushes. Callers holding the same refresh
++// token share one exchange rather than each spending it.
++const inFlightRefreshes = new Map<string, Promise<RefreshOutcome>>();
++
++/** Exchange a refresh token at the token endpoint. Writes no cookies. */
++export function requestTokenRefresh(
++  refreshToken: string,
++  serverId: string | null,
++): Promise<RefreshOutcome> {
++  let pending = inFlightRefreshes.get(refreshToken);
++  if (!pending) {
++    pending = exchangeRefreshToken(refreshToken, serverId)
++      .finally(() => inFlightRefreshes.delete(refreshToken));
++    inFlightRefreshes.set(refreshToken, pending);
++  }
++  return pending;
++}
++
++async function exchangeRefreshToken(
++  refreshToken: string,
++  serverId: string | null,
++): Promise<RefreshOutcome> {
++  // The refresh token may have been minted by the password+TOTP login route,
++  // which works without a configured OAuth client by falling back to the
++  // default client id - refreshing must fall back the same way (#873).
++  const tokenEndpoint = await getTokenEndpoint(serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
++
++  const params = buildOAuthParams({
++    grant_type: 'refresh_token',
++    refresh_token: refreshToken,
++  }, serverId, { fallbackClientId: DEFAULT_CLIENT_ID });
++
++  const tokenResponse = await fetch(tokenEndpoint, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
++    body: params.toString(),
++    // Never follow a redirect with the refresh token in the body: the
++    // endpoint was validated, its redirect target was not.
++    redirect: 'error',
++  });
++
++  if (!tokenResponse.ok) {
++    const errorText = await tokenResponse.text();
++    logger.error('Token refresh failed', { status: tokenResponse.status, error: errorText });
++    const status = tokenResponse.status;
++    return { ok: false, reason: status === 400 || status === 401 || status === 403 ? 'rejected' : 'unavailable' };
++  }
++
++  const tokens = await tokenResponse.json();
++
++  if (!tokens.access_token) {
++    logger.error('Refresh response missing access_token', { response: JSON.stringify(tokens).substring(0, 500) });
++    return { ok: false, reason: 'invalid-response' };
++  }
++
++  return { ok: true, tokens: { ...tokens, expires_in: tokens.expires_in || 3600 } };
++}
++
++/** Store what a refresh returned: the rotated refresh token, the access token cache, the id token. */
++export function storeRefreshedTokens(
++  cookieStore: CookieStore,
++  slot: number,
++  tokens: RefreshedTokens,
++  basePath: string | undefined,
++): void {
++  if (tokens.refresh_token) {
++    cookieStore.set(refreshTokenCookieName(slot), tokens.refresh_token, getCookieOptions());
++  }
++
++  const cachedAccessToken = cacheAccessToken(cookieStore, slot, tokens.access_token, tokens.expires_in);
++  // Providers may reissue the id token on refresh. Only a slot signed in
++  // through the provider keeps one; a password login's slot gains none here.
++  if (typeof tokens.id_token === 'string' && cookieStore.get(idTokenCookieName(slot))) {
++    storeIdToken(cookieStore, slot, tokens.id_token, basePath, [tokens.refresh_token, cachedAccessToken]);
++  }
++}
++
++/** The slot's refresh token and the server entry that minted it, or null when there is none. */
++export function readRefreshToken(
++  cookieStore: CookieStore,
++  slot: number,
++): { refreshToken: string; serverId: string | null } | null {
++  const refreshToken = cookieStore.get(refreshTokenCookieName(slot))?.value;
++  if (!refreshToken) return null;
++  return { refreshToken, serverId: cookieStore.get(refreshTokenServerCookieName(slot))?.value || null };
++}
