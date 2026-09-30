@@ -1,0 +1,155 @@
+diff --git a/app/api/push/preview/route.ts b/app/api/push/preview/route.ts
+index 9989f69..bb2f0d4 100644
+--- a/app/api/push/preview/route.ts
++++ b/app/api/push/preview/route.ts
+@@ -13,6 +13,7 @@ import {
+   storeRefreshedTokens,
+   type RefreshedTokens,
+ } from '@/lib/oauth/refresh-slot';
++import { getRequiredConfig, DEFAULT_CLIENT_ID } from '@/lib/oauth/token-exchange';
+ import {
+   getStalwartCredentials,
+   type StalwartCredentials,
+@@ -77,8 +78,17 @@ async function resolveTargetForAccount(
+     // remembered sign-in but not the context; rebuild it, as the app does.
+     const ctx = readStalwartAuthContextFromStore(cookieStore, slot)
+       ?? restoreStalwartAuthContextFromSession(cookieStore, slot);
+-    if (!ctx) continue;
+-    const serverUrl = ctx.serverUrl.replace(/\/+$/, '');
++    // An OAuth sign-in (a TOTP account's, say) keeps only its 30-day refresh
++    // token across such a restart; the context is rebuilt from it below.
++    const refreshServerId = ctx ? null : readRefreshToken(cookieStore, slot)?.serverId;
++    if (!ctx && refreshServerId === undefined) continue;
++    let serverUrl: string;
++    try {
++      serverUrl = (ctx?.serverUrl ?? getRequiredConfig(refreshServerId, { fallbackClientId: DEFAULT_CLIENT_ID }).serverUrl)
++        .replace(/\/+$/, '');
++    } catch {
++      continue;
++    }
+     probes.push(
+       (async () => {
+         try {
+@@ -86,13 +96,15 @@ async function resolveTargetForAccount(
+           const probe = (authHeader: string) => fetchJmapServer(`${serverUrl}/.well-known/jmap`, {
+             headers: { Authorization: authHeader },
+           }, trusted);
+-          let authHeader = ctx.authHeader;
+-          let res = await probe(authHeader);
+-          // Only an OAuth session renews; a Basic credential does not expire.
+-          if (res.status === 401 && authHeader.startsWith('Bearer ')) {
+-            const renewed = await renewBearer(cookieStore, slot);
+-            if (!renewed) return null;
+-            authHeader = `Bearer ${renewed.access_token}`;
++          let authHeader = ctx?.authHeader ?? '';
++          let res = ctx ? await probe(authHeader) : null;
++          let renewed = false;
++          // Renew an expired OAuth token, or a context that is gone. A Basic
++          // credential does not expire.
++          if (!res || (res.status === 401 && authHeader.startsWith('Bearer '))) {
++            const tokens = await renewBearer(cookieStore, slot);
++            if (!tokens) return null;
++            authHeader = `Bearer ${tokens.access_token}`;
+             res = await probe(authHeader);
+             if (!res.ok) {
+               logger.warn('push preview renewed a session token the server then refused', { slot, status: res.status });
+@@ -100,8 +112,8 @@ async function resolveTargetForAccount(
+             }
+             // Stored only once the new token has worked, so the open app
+             // resumes with it and the next preview needs no refresh.
+-            storeRefreshedTokens(cookieStore, slot, renewed, basePath);
+-            setStalwartAuthContextInStore(cookieStore, slot, { ...ctx, authHeader });
++            storeRefreshedTokens(cookieStore, slot, tokens, basePath);
++            renewed = true;
+           }
+           if (!res.ok) {
+             logger.warn('push preview could not open the session', {
+@@ -113,9 +125,16 @@ async function resolveTargetForAccount(
+           }
+           const session = (await res.json()) as {
+             apiUrl?: string;
++            username?: string;
+             primaryAccounts?: Record<string, string>;
+             accounts?: Record<string, unknown>;
+           };
++          if (renewed) {
++            const username = ctx?.username ?? session.username;
++            if (username) {
++              setStalwartAuthContextInStore(cookieStore, slot, ctx ? { ...ctx, authHeader } : { serverUrl, username, authHeader });
++            }
++          }
+           const mailAccountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'];
+           if (!session.apiUrl || !mailAccountId) return null;
+           // Shared and group mailboxes are never the primary mail account -
+diff --git a/lib/__tests__/push-preview-route.test.ts b/lib/__tests__/push-preview-route.test.ts
+index 2b5c4aa..1861361 100644
+--- a/lib/__tests__/push-preview-route.test.ts
++++ b/lib/__tests__/push-preview-route.test.ts
+@@ -56,6 +56,11 @@ vi.mock('@/lib/stalwart/server-fetch', () => ({
+   isTrustedJmapServerUrl: async () => true,
+ }));
+ 
++vi.mock('@/lib/oauth/token-exchange', () => ({
++  getRequiredConfig: () => ({ serverUrl: 'https://mail.example.com/' }),
++  DEFAULT_CLIENT_ID: 'bulwark-webmail',
++}));
++
+ vi.mock('@/lib/security/url-guard', () => ({
+   DisallowedUrlError: class DisallowedUrlError extends Error {},
+ }));
+@@ -66,6 +71,7 @@ function jsonResponse(data: unknown) {
+ 
+ const SESSION = {
+   apiUrl: 'https://mail.example.com/jmap',
++  username: 'me@example.com',
+   primaryAccounts: { 'urn:ietf:params:jmap:mail': 'a' },
+   accounts: { a: { name: 'me@example.com' }, g: { name: 'group@example.com' } },
+ };
+@@ -152,7 +158,9 @@ describe('push preview route after the session token expired', () => {
+     hasContext = true;
+     restored = null;
+     mockJmap('Bearer fresh');
+-    readRefreshToken.mockReturnValue({ refreshToken: 'rt1', serverId: null });
++    // One signed-in slot, as a real cookie store has: slot 1 holds nothing.
++    readRefreshToken.mockImplementation((_store: unknown, slot: number) =>
++      slot === 0 ? { refreshToken: 'rt1', serverId: null } : null);
+     requestTokenRefresh.mockResolvedValue({ ok: true, tokens: RENEWED });
+   });
+ 
+@@ -232,8 +240,26 @@ describe('push preview route after the session token expired', () => {
+     expect(requestTokenRefresh).not.toHaveBeenCalled();
+   });
+ 
++  it('rebuilds a lost OAuth context from the refresh token alone', async () => {
++    // A TOTP account signs in with OAuth; after a background browser restart
++    // only its 30-day refresh token comes back.
++    hasContext = false;
++    const { status, body } = await callRoute('a');
++
++    expect(status).toBe(200);
++    expect(body.email).toMatchObject({ id: 'e1', subject: 'Hi' });
++    expect(requestTokenRefresh).toHaveBeenCalledWith('rt1', null);
++    expect(storeRefreshedTokens).toHaveBeenCalledWith(cookieStore, 0, RENEWED, undefined);
++    expect(setStalwartAuthContextInStore).toHaveBeenCalledWith(cookieStore, 0, {
++      serverUrl: 'https://mail.example.com',
++      username: 'me@example.com',
++      authHeader: 'Bearer fresh',
++    });
++  });
++
+   it('says which cookies arrived when no session context did, by name only', async () => {
+     hasContext = false;
++    readRefreshToken.mockReturnValue(null);
+     const { status } = await callRoute('a');
+ 
+     expect(status).toBe(401);
+@@ -246,7 +272,8 @@ describe('push preview route after the session token expired', () => {
+     const { status } = await callRoute('a');
+ 
+     expect(status).toBe(401);
+-    expect(readRefreshToken).not.toHaveBeenCalled();
++    // The Basic slot never looks for a refresh token (the empty slot 1 may).
++    expect(readRefreshToken).not.toHaveBeenCalledWith(cookieStore, 0);
+     expect(requestTokenRefresh).not.toHaveBeenCalled();
+   });
+ 

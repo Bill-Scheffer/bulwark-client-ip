@@ -85,6 +85,16 @@ The preview now does the same, through one helper both routes use
 The renewal e2e's last step signs in with "remember me", drops the context cookie, and needs the
 preview to answer 200 and store a fresh context; against `clientip.6` it fails there.
 
+## OAuth sign-ins after a restart
+
+[`patches/0007-push-preview-restores-oauth-session.patch`](patches/0007-push-preview-restores-oauth-session.patch).
+The same restart leaves an OAuth sign-in (what an account with TOTP gets) with only its 30-day refresh
+token: no context, no cached access token, no remembered sign-in. The preview now renews from the
+refresh token (0003's exchange), opens the session with the new token, and only then stores the new
+token and a rebuilt context (server from the refresh token's own server entry, username from the JMAP
+session). The e2e keeps only the refresh-token cookie and needs a 200 preview; against `clientip.7` it
+fails there.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

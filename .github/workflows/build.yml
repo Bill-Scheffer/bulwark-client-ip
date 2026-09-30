@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with six patches:
+# Builds Bulwark from its own release source with seven patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -21,6 +21,9 @@
 #     but its context cookie ends with the browser session, so a phone's browser restarted by a push
 #     comes back without it and the preview answered 401. The preview now rebuilds the context from
 #     the remembered sign-in, through the helper the app's own restore uses.
+#   0007-push-preview-restores-oauth-session.patch: the same for an OAuth sign-in (what a TOTP account
+#     gets), which keeps only its 30-day refresh token across that restart: the preview renews from it,
+#     opens the session, and stores the rebuilt context only once that has worked.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -44,7 +47,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.7
+  VERSION: 1.11.2-clientip.8
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -81,7 +84,8 @@ jobs:
                    ../patch/patches/0003-push-preview-renews-expired-session.patch \
                    ../patch/patches/0004-notification-badge.patch \
                    ../patch/patches/0005-push-preview-says-why.patch \
-                   ../patch/patches/0006-push-preview-restores-remembered-session.patch; do
+                   ../patch/patches/0006-push-preview-restores-remembered-session.patch \
+                   ../patch/patches/0007-push-preview-restores-oauth-session.patch; do
             git apply --check "$p"
             git apply "$p"
           done

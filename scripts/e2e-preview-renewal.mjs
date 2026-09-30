@@ -125,7 +125,15 @@ r = await getPreview('second expiry', jar);
 if (r.status !== 200 || r.body.email?.subject !== SUBJECT) fail('the preview failed after a second expiry');
 if (!r.names.includes('jmap_stalwart_ctx')) fail('the second expiry did not renew; the check measured nothing');
 
-// 7. A remembered ("remember me") sign-in is Basic and has no refresh token. A browser restarted in the
+// 7. An OAuth sign-in (a TOTP account's) keeps only its 30-day refresh token when a push wakes a phone
+// whose browser was killed: no context, no cached token. The preview must rebuild the context from it.
+const refreshOnly = new Map([...jar].filter(([k]) => k.startsWith('jmap_rt')));
+console.log(`OAuth sign-in; the restarted browser sends: ${[...refreshOnly.keys()].join(', ')}`);
+r = await getPreview('OAuth sign-in, context dropped', refreshOnly);
+if (r.status !== 200 || r.body.email?.subject !== SUBJECT) fail('the preview did not rebuild a dropped OAuth context from the refresh token');
+if (!r.names.includes('jmap_stalwart_ctx')) fail('the rebuilt OAuth context was not stored');
+
+// 8. A remembered ("remember me") sign-in is Basic and has no refresh token. A browser restarted in the
 // background keeps its 30-day cookie but drops the session-scoped context; the preview must rebuild it.
 const remembered = new Map();
 const rs = await bw(remembered, '/api/auth/session', {
