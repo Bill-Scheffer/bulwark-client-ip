@@ -95,6 +95,18 @@ token and a rebuilt context (server from the refresh token's own server entry, u
 session). The e2e keeps only the refresh-token cookie and needs a 200 preview; against `clientip.7` it
 fails there.
 
+## No stability banner on the Files page
+
+[`patches/0008-files-no-stability-banner.patch`](patches/0008-files-no-stability-banner.patch).
+Upstream's Files page always shows "Large file uploads can cause server instability…". The risk it
+describes is Stalwart on RocksDB (the admin text says so); MainThrive's Stalwart is PostgreSQL + R2,
+where a file's bytes go to R2 like a mail attachment's (measured: a 25 MiB file added 48 kB to
+Postgres). Stalwart bounds each upload (25 MiB per WebDAV request and per file) and each account (4
+requests at once, about 80 MiB of memory per 25 MiB upload in flight). Nothing yet bounds uploads
+server-wide, the same as for mail attachments; that is a scaling item with a measured budget, not
+something a banner can fix, so the banner goes. The workflow refuses a build whose Files page still
+renders it.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

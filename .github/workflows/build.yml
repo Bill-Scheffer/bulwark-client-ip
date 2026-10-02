@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with seven patches:
+# Builds Bulwark from its own release source with eight patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -24,6 +24,11 @@
 #   0007-push-preview-restores-oauth-session.patch: the same for an OAuth sign-in (what a TOTP account
 #     gets), which keeps only its 30-day refresh token across that restart: the preview renews from it,
 #     opens the session, and stores the rebuilt context only once that has worked.
+#   0008-files-no-stability-banner.patch: the Files page no longer shows its "Large file uploads can
+#     cause server instability" banner. It describes Stalwart on RocksDB; ours is PostgreSQL + R2, where
+#     a file's bytes go to R2 (measured). Stalwart bounds each upload (25 MiB per request and per file)
+#     and each account (4 requests at once); a server-wide bound is tracked as a scaling item, not
+#     left to a banner (MAI-263).
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -47,7 +52,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.8
+  VERSION: 1.11.2-clientip.9
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -85,7 +90,8 @@ jobs:
                    ../patch/patches/0004-notification-badge.patch \
                    ../patch/patches/0005-push-preview-says-why.patch \
                    ../patch/patches/0006-push-preview-restores-remembered-session.patch \
-                   ../patch/patches/0007-push-preview-restores-oauth-session.patch; do
+                   ../patch/patches/0007-push-preview-restores-oauth-session.patch \
+                   ../patch/patches/0008-files-no-stability-banner.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -95,8 +101,11 @@ jobs:
             '?? lib/oauth/refresh-slot.ts' '?? lib/__tests__/refresh-slot.test.ts' \
             ' M .env.example' ' M app/api/pwa-icon/[size]/route.ts' ' M lib/admin/types.ts' ' M public/sw.js' \
             '?? lib/__tests__/pwa-icon-badge.test.ts' \
-            ' M app/api/auth/session/route.ts' ' M lib/stalwart/auth-context.ts' '?? lib/__tests__/auth-context-restore.test.ts' | LC_ALL=C sort | tr '\n' '|')
+            ' M app/api/auth/session/route.ts' ' M lib/stalwart/auth-context.ts' '?? lib/__tests__/auth-context-restore.test.ts' \
+            ' M components/files/files-app.tsx' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
+          # 0008: the Files page renders no stability banner.
+          ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
