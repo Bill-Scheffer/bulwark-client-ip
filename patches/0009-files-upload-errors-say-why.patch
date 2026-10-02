@@ -1,24 +1,41 @@
 diff --git a/components/files/files-app.tsx b/components/files/files-app.tsx
-index cf19c3b..62d37fb 100644
+index cf19c3b..106fdff 100644
 --- a/components/files/files-app.tsx
 +++ b/components/files/files-app.tsx
-@@ -333,7 +333,8 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
+@@ -319,6 +319,12 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
+ 
+   const maxSizeUpload = client?.getMaxSizeUpload() || 0;
+ 
++  // The server says why a file was refused (malware, could not be scanned, too large): show it.
++  const uploadErrorText = useCallback(
++    (err: unknown) => (err instanceof Error && err.message ? `${t("upload_error")}: ${err.message}` : t("upload_error")),
++    [t],
++  );
++
+   const handleUploadFiles = useCallback(async (files: File[]) => {
+     if (maxSizeUpload > 0) {
+       const oversized = files.filter(f => f.size > maxSizeUpload);
+@@ -333,9 +339,9 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
        toast.success(t("upload_success", { count: files.length }));
      } catch (err) {
        console.error("Failed to upload files:", err);
 -      toast.error(t("upload_error"));
-+      // The server says why (malware, could not be scanned, too large): show it.
-+      toast.error(err instanceof Error && err.message ? `${t("upload_error")}: ${err.message}` : t("upload_error"));
++      toast.error(uploadErrorText(err));
      }
-   }, [uploadFiles, t, maxSizeUpload]);
+-  }, [uploadFiles, t, maxSizeUpload]);
++  }, [uploadFiles, t, maxSizeUpload, uploadErrorText]);
  
-@@ -351,7 +352,8 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
+   const handleUploadFolder = useCallback(async (files: File[]) => {
+     if (maxSizeUpload > 0) {
+@@ -351,9 +357,9 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
        toast.success(t("upload_success", { count: files.length }));
      } catch (err) {
        console.error("Failed to upload folder:", err);
 -      toast.error(t("upload_error"));
-+      // The server says why (malware, could not be scanned, too large): show it.
-+      toast.error(err instanceof Error && err.message ? `${t("upload_error")}: ${err.message}` : t("upload_error"));
++      toast.error(uploadErrorText(err));
      }
-   }, [uploadFolder, t, maxSizeUpload]);
+-  }, [uploadFolder, t, maxSizeUpload]);
++  }, [uploadFolder, t, maxSizeUpload, uploadErrorText]);
  
+   const handleDelete = useCallback(async (name: string) => {
+     const confirmed = await confirmDialog({

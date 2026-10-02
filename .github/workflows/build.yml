@@ -110,7 +110,8 @@ jobs:
           # 0008: the Files page renders no stability banner.
           ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
           # 0009: both Files upload handlers show the server's reason.
-          [ "$(grep -cF 'err.message ? `${t("upload_error")}: ${err.message}`' components/files/files-app.tsx)" = 2 ] \
+          [ "$(grep -cF 'toast.error(uploadErrorText(err));' components/files/files-app.tsx)" = 2 ] \
+            && grep -qF 'err.message ? `${t("upload_error")}: ${err.message}`' components/files/files-app.tsx \
             || { echo "::error::a Files upload error does not show the server's reason"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
