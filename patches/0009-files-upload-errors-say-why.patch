@@ -1,0 +1,24 @@
+diff --git a/components/files/files-app.tsx b/components/files/files-app.tsx
+index cf19c3b..62d37fb 100644
+--- a/components/files/files-app.tsx
++++ b/components/files/files-app.tsx
+@@ -333,7 +333,8 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
+       toast.success(t("upload_success", { count: files.length }));
+     } catch (err) {
+       console.error("Failed to upload files:", err);
+-      toast.error(t("upload_error"));
++      // The server says why (malware, could not be scanned, too large): show it.
++      toast.error(err instanceof Error && err.message ? `${t("upload_error")}: ${err.message}` : t("upload_error"));
+     }
+   }, [uploadFiles, t, maxSizeUpload]);
+ 
+@@ -351,7 +352,8 @@ export function FilesApp({ linkSegments: routeSegments }: FilesAppProps = {}) {
+       toast.success(t("upload_success", { count: files.length }));
+     } catch (err) {
+       console.error("Failed to upload folder:", err);
+-      toast.error(t("upload_error"));
++      // The server says why (malware, could not be scanned, too large): show it.
++      toast.error(err instanceof Error && err.message ? `${t("upload_error")}: ${err.message}` : t("upload_error"));
+     }
+   }, [uploadFolder, t, maxSizeUpload]);
+ 

@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with eight patches:
+# Builds Bulwark from its own release source with nine patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -29,6 +29,8 @@
 #     a file's bytes go to R2 (measured). Stalwart bounds each upload (25 MiB per request and per file)
 #     and each account (4 requests at once); a server-wide bound is tracked as a scaling item, not
 #     left to a banner (MAI-263).
+#   0009-files-upload-errors-say-why.patch: a refused Files upload shows the server's reason (malware,
+#     could not be scanned, too large) after "Failed to upload file", not the bare generic toast.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -52,7 +54,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.9
+  VERSION: 1.11.2-clientip.10
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -91,7 +93,8 @@ jobs:
                    ../patch/patches/0005-push-preview-says-why.patch \
                    ../patch/patches/0006-push-preview-restores-remembered-session.patch \
                    ../patch/patches/0007-push-preview-restores-oauth-session.patch \
-                   ../patch/patches/0008-files-no-stability-banner.patch; do
+                   ../patch/patches/0008-files-no-stability-banner.patch \
+                   ../patch/patches/0009-files-upload-errors-say-why.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -106,6 +109,9 @@ jobs:
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
           # 0008: the Files page renders no stability banner.
           ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
+          # 0009: both Files upload handlers show the server's reason.
+          [ "$(grep -cF 'err.message ? `${t("upload_error")}: ${err.message}`' components/files/files-app.tsx)" = 2 ] \
+            || { echo "::error::a Files upload error does not show the server's reason"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:

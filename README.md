@@ -107,6 +107,17 @@ server-wide, the same as for mail attachments; that is a scaling item with a mea
 something a banner can fix, so the banner goes. The workflow refuses a build whose Files page still
 renders it.
 
+## Files upload errors say why (`0009`, `clientip.10`)
+
+[`patches/0009-files-upload-errors-say-why.patch`](patches/0009-files-upload-errors-say-why.patch).
+The Files page uploads through JMAP (blob upload, then `FileNode/set`), and the client already throws
+the server's description; the page discarded it and showed "Failed to upload file" for everything.
+With MainThrive's Stalwart (stalwart-r2-patch 0004) a refused file now reads, for example, "Failed to
+upload file: The file contains malware.", "...: The file could not be scanned for malware; try again
+later." or "...: The file is larger than the 25 MB limit." No new translation key: the reason is the
+server's, appended to the existing message. The workflow refuses a build where either upload handler
+drops it.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
