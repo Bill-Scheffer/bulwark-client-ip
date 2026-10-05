@@ -1,0 +1,124 @@
+diff --git a/stores/__tests__/auth-store-restore-outage.test.ts b/stores/__tests__/auth-store-restore-outage.test.ts
+new file mode 100644
+index 0000000..83b898f
+--- /dev/null
++++ b/stores/__tests__/auth-store-restore-outage.test.ts
+@@ -0,0 +1,94 @@
++import { beforeEach, expect, it, vi } from 'vitest';
++
++// A page load during a server outage must keep the remembered sign-in. The
++// restore used to evict the account, and clear its saved credentials, on any
++// error it did not recognise as an outage - and a request timeout, or a fetch
++// that failed while a re-probe got through (CORS_ERROR, what a load balancer
++// switching origins produces), were not recognised. Measured in a node-loss
++// drill: the user was signed out by a refresh. A real rejection still evicts.
++let connectError: Error | null = null;
++vi.mock('@/lib/jmap/client', () => {
++  class RequestTimeoutError extends Error {
++    constructor(public timeoutMs: number) { super(`Request timed out after ${timeoutMs}ms`); this.name = 'RequestTimeoutError'; }
++  }
++  class JMAPClient {
++    constructor(public serverUrl: string, public username: string, public password: string) {}
++    static withBearer() { throw new Error('not used'); }
++    async connect() { if (connectError) throw connectError; }
++    getSessionUsername() { return this.username; }
++    getUsername() { return this.username; }
++    async getIdentities() { return [{ id: 'a', email: this.username, name: this.username, mayDelete: false }]; }
++    getAuthHeader() { return 'Basic eA=='; }
++    onConnectionChange() {}
++    onRateLimit() {}
++    getRateLimitRemainingMs() { return 0; }
++    supportsContacts() { return false; }
++    supportsPrincipals() { return false; }
++    supportsVacationResponse() { return false; }
++    supportsCalendars() { return false; }
++    supportsSieve() { return false; }
++    disconnect() {}
++    getAccountId() { return 'acct'; }
++  }
++  class RateLimitError extends Error {}
++  return { JMAPClient, RateLimitError, RequestTimeoutError };
++});
++vi.mock('@/lib/stalwart/principal', () => ({ fetchPrincipalDisplayName: async () => null }));
++
++import * as nav from '@/lib/browser-navigation';
++import { RequestTimeoutError } from '@/lib/jmap/client';
++import { useAuthStore } from '@/stores/auth-store';
++import { useAccountStore } from '@/stores/account-store';
++
++const A = {
++  id: 'alice@mail.x.test', label: 'alice@x.test', serverUrl: 'https://mail.x.test', username: 'alice@x.test',
++  authMode: 'basic' as const, rememberMe: true, cookieSlot: 0, displayName: 'alice@x.test', email: 'alice@x.test',
++  isConnected: false, hasError: false, lastLoginAt: 1, avatarColor: '#000', isDefault: true,
++};
++const deletes: string[] = [];
++
++beforeEach(() => {
++  connectError = null;
++  deletes.length = 0;
++  sessionStorage.clear();
++  vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
++    const url = String(input);
++    const method = init?.method ?? 'GET';
++    if (url.includes('/api/auth/session')) {
++      if (method === 'DELETE') { deletes.push(url); return new Response('{}', { status: 200 }); }
++      return new Response(JSON.stringify({ serverUrl: A.serverUrl, username: A.username, password: 'pw' }), { status: 200 });
++    }
++    if (url.includes('/api/auth/token') && method === 'DELETE') { deletes.push(url); return new Response('{}', { status: 200 }); }
++    if (url.includes('/api/config')) return new Response(JSON.stringify({ settingsSyncEnabled: false }), { status: 200 });
++    return new Response('{}', { status: 200 });
++  }));
++  vi.spyOn(nav, 'replaceWindowLocation').mockImplementation(() => {});
++  useAccountStore.setState({ accounts: [A] as never, activeAccountId: A.id, defaultAccountId: A.id });
++  useAuthStore.setState({ isAuthenticated: false, activeAccountId: null, client: null });
++});
++
++const restoreWith = async (err: Error) => {
++  connectError = err;
++  await useAuthStore.getState().checkAuth();
++  return useAccountStore.getState().getAccountById(A.id);
++};
++
++it.each([
++  ['a request timeout', () => new RequestTimeoutError(30_000)],
++  ['a fetch that failed while the server answered a probe', () => new Error('CORS_ERROR')],
++  ['the network being unreachable', () => new TypeError('Failed to fetch')],
++  ['a 502 from the proxy', () => new Error('Failed to get session: 502')],
++])('keeps the remembered sign-in through %s', async (_name, err) => {
++  const kept = await restoreWith(err());
++  expect(kept?.errorMessage).toBe('Server unreachable');
++  await new Promise((r) => setTimeout(r, 50)); // an eviction's credential delete is not awaited
++  expect(deletes).toEqual([]);
++  expect(sessionStorage.getItem('session_expired')).toBeNull();
++});
++
++it('still signs out on a real rejection', async () => {
++  const kept = await restoreWith(new Error('Invalid username or password'));
++  expect(kept).toBeUndefined();
++  await vi.waitFor(() => expect(deletes.length).toBeGreaterThan(0));
++  expect(sessionStorage.getItem('session_expired')).toBe('true');
++});
+diff --git a/stores/auth-store.ts b/stores/auth-store.ts
+index 9e6a88d..10e3813 100644
+--- a/stores/auth-store.ts
++++ b/stores/auth-store.ts
+@@ -1,6 +1,6 @@
+ import { create } from 'zustand';
+ import { persist } from 'zustand/middleware';
+-import { JMAPClient, RateLimitError } from '@/lib/jmap/client';
++import { JMAPClient, RateLimitError, RequestTimeoutError } from '@/lib/jmap/client';
+ import type { IJMAPClient } from '@/lib/jmap/client-interface';
+ import { useIdentityStore } from './identity-store';
+ import { setClientLookup } from './client-registry';
+@@ -184,6 +184,11 @@ function isTransientAuthError(error: unknown): boolean {
+   if (error instanceof TransientAuthError) return true;
+   // fetch() rejects with TypeError when the network is unreachable.
+   if (error instanceof TypeError) return true;
++  // A timed-out request, or a fetch that failed while a re-probe got through
++  // (connect() reports that as CORS_ERROR - what a load balancer switching
++  // origins produces), is an outage too, not a rejection.
++  if (error instanceof RequestTimeoutError) return true;
++  if (error instanceof Error && error.message === 'CORS_ERROR') return true;
+   // JMAPClient.connect()/refreshSession() embed the HTTP status in the
+   // message - a 5xx there is the server being down, not an auth failure.
+   if (error instanceof Error) {
