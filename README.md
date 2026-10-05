@@ -118,6 +118,21 @@ later." or "...: The file is larger than the 25 MB limit." No new translation ke
 server's, appended to the existing message. The workflow refuses a build where either upload handler
 drops it.
 
+## Sign-ins survive an outage (`0010`, `clientip.11`)
+
+[`patches/0010-restore-keeps-session-through-outage.patch`](patches/0010-restore-keeps-session-through-outage.patch).
+On a page load the app restores each remembered account, and any error it did not recognise as an
+outage removed the account and deleted its remembered sign-in: the user saw "session expired" and had
+to type the password again. It recognised a network failure and a 5xx, but not the two errors a
+server outage behind a load balancer also produces: a request that timed out (30 s), and a fetch that
+failed while a second probe got through, which the client reports as `CORS_ERROR`. MainThrive's
+node-loss drill (2026-10-04) signed a user out exactly this way during a refresh. Both now keep the
+account, marked "Server unreachable", and it reconnects when the server answers. A real rejection
+(401) still signs out. The cost: a genuine CORS misconfiguration now shows "Server unreachable"
+instead of a sign-out, which never fixed it either. `stores/__tests__/auth-store-restore-outage.test.ts`
+fails on unpatched 1.11.2 for exactly the two new cases and passes its three controls (a network
+failure, a 502, a real rejection).
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
