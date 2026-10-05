@@ -128,8 +128,9 @@ server outage behind a load balancer also produces: a request that timed out (30
 failed while a second probe got through, which the client reports as `CORS_ERROR`. MainThrive's
 node-loss drill (2026-10-04) signed a user out exactly this way during a refresh. Both now keep the
 account, marked "Server unreachable", and it reconnects when the server answers. A real rejection
-(401) still signs out. The cost: a genuine CORS misconfiguration now shows "Server unreachable"
-instead of a sign-out, which never fixed it either. `stores/__tests__/auth-store-restore-outage.test.ts`
+(401) still signs out. The cost: a PERMANENT CORS misconfiguration now also keeps the session, so the
+user sees a stuck "Server unreachable" state instead of the sign-in screen (which never fixed it
+either). No credential is exposed by that: the remembered sign-in stays in its cookie as before. `stores/__tests__/auth-store-restore-outage.test.ts`
 fails on unpatched 1.11.2 for exactly the two new cases and passes its three controls (a network
 failure, a 502, a real rejection).
 
