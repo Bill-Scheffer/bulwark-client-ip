@@ -134,6 +134,36 @@ either). No credential is exposed by that: the remembered sign-in stays in its c
 fails on unpatched 1.11.2 for exactly the two new cases and passes its three controls (a network
 failure, a 502, a real rejection).
 
+## Two-step sign-ins keep their account security (`0011`, `clientip.12`)
+
+[`patches/0011-token-session-keeps-account-security.patch`](patches/0011-token-session-keeps-account-security.patch).
+A sign-in with a two-step code goes through Stalwart's token login, so the session is a token
+(`authMode: 'oauth'`) session. Upstream's Settings → Security showed such a session no Change Password,
+no Display Name and no Two-Factor Authentication: a user who turned two-step on could no longer change
+their password or turn two-step off. Instead it showed Email Client Setup (a "JMAP Username" for JMAP
+clients) and Link Mobile App (a QR code for upstream's own mobile app), neither of which MainThrive
+offers. Measured on a throwaway of MainThrive's Stalwart (v0.16.25 build) with a bearer token minted the
+way `totp-token-exchange` mints one: the display name, a password change (with the current code, which
+the form already sends) and turning two-step off and on again all succeed.
+
+The patch shows the three sections to every session, and no longer shows the two others (their
+components stay in the source, unrendered, to keep the patch small).
+
+A password change needs one more thing in a token session: Stalwart revokes the session's access **and**
+refresh tokens when the password changes. `keepTokenSessionThrough` runs the change, then signs in again
+through `totp-token-exchange` with the new password and the code the change was confirmed with (Stalwart
+accepted that code a second time within its window, measured), as `updateBasicPassword` already does for a
+password session. From before the change is sent until that sign-in lands, it holds the account's token
+refresh: a request that meets the revoked token in between (a push reconnect, a poll) waits for the new
+token, where a refresh would have spent the revoked refresh token, been refused, and signed the user out
+at once. If the new sign-in is refused, the session ends there as an expired one, and the user signs in
+again with the new password. A sign-out during it is respected, as in `refreshAccessToken`.
+
+`stores/__tests__/auth-store-token-password.test.ts` (the sign-in, the held refresh, a refused sign-in, a
+refused change, a password session), `components/settings/__tests__/account-security-token-session.test.tsx`
+(both session kinds render and load the sections) and one new assertion in
+`stores/__tests__/account-security-store.test.ts`. On unpatched 1.11.2 the token-session cases fail.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
@@ -152,7 +182,8 @@ fresh, 401 after.
 
 Upstream's full suite passes with the patches applied except tests that fail on unpatched 1.11.2
 too: `health-route` and `idn` when 0001 was measured, and `health-route` and `birthday-calendar` (on a
-Node 22 host) when 0003 was.
+Node 22 host) when 0003 was, and the same two when 0011 was (4862 passed; both fail identically with
+0011 reverted).
 
 Image: `ghcr.io/bill-scheffer/bulwark-client-ip:<bulwark tag>-clientip.N`. Pin it by digest.
 
