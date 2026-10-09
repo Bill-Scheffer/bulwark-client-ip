@@ -146,7 +146,7 @@ offers. Measured on a throwaway of MainThrive's Stalwart (v0.16.25 build) with a
 way `totp-token-exchange` mints one: the display name, a password change (with the current code, which
 the form already sends) and turning two-step off and on again all succeed.
 
-The patch shows the three sections to every session, and removes the two others. One more thing makes
+The patch shows the three sections to every session, and no longer shows the two others (their components stay in the source, unrendered, to keep the patch small). One more thing makes
 a password change work for a token session: Stalwart revokes the session's access **and** refresh
 tokens when the password changes, so the session would end on its next request. After the change it now
 signs in again through `totp-token-exchange` with the new password and the code the change was

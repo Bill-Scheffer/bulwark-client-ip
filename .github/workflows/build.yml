@@ -40,7 +40,7 @@
 #     so a two-step user could not change their password or turn two-step off (Stalwart accepts all three
 #     on the bearer token, measured). After a password change, which revokes the session's tokens, the
 #     session signs in again with the new password and the confirming code. Email Client Setup and Link
-#     Mobile App (for upstream's own app and JMAP clients, which this deployment does not offer) are gone.
+#     Mobile App (for upstream's own app and JMAP clients, which this deployment does not offer) are no longer shown.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
