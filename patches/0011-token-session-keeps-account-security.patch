@@ -190,10 +190,10 @@ index 7e8454d..3908fac 100644
        expect(args.update.singleton).toEqual({ currentSecret: 'old', secret: 'new', 'otpAuth/otpCode': '123456' });
 diff --git a/stores/__tests__/auth-store-token-password.test.ts b/stores/__tests__/auth-store-token-password.test.ts
 new file mode 100644
-index 0000000..5a69a7d
+index 0000000..b50a87d
 --- /dev/null
 +++ b/stores/__tests__/auth-store-token-password.test.ts
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,137 @@
 +import { beforeEach, expect, it, vi } from 'vitest';
 +
 +// Patch 0011. A two-step sign-in is a token session, and Stalwart revokes its
@@ -220,10 +220,12 @@ index 0000000..5a69a7d
 +const logout = vi.fn(async () => {});
 +let calls: Array<{ url: string; method: string; body: string }> = [];
 +let exchangeStatus = 200;
++let refreshStatus = 401;
 +
 +beforeEach(() => {
 +  calls = [];
 +  exchangeStatus = 200;
++  refreshStatus = 401;
 +  updateAccessToken.mockReset();
 +  logout.mockReset();
 +  vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
@@ -234,8 +236,12 @@ index 0000000..5a69a7d
 +        ? new Response(JSON.stringify({ access_token: 'new-at', expires_in: 3600, has_refresh_token: true }), { status: 200 })
 +        : new Response(JSON.stringify({ error: 'invalid_credentials' }), { status: exchangeStatus });
 +    }
-+    // The revoked refresh token: the route answers 401, which signs the session out.
-+    if (url.includes('/api/auth/token')) return new Response('{}', { status: 401 });
++    // By default the revoked refresh token: the route answers 401, which signs the session out.
++    if (url.includes('/api/auth/token')) {
++      return refreshStatus === 200
++        ? new Response(JSON.stringify({ access_token: 'pre-at', expires_in: 3600 }), { status: 200 })
++        : new Response('{}', { status: refreshStatus });
++    }
 +    return new Response('{}', { status: 200 });
 +  }));
 +});
@@ -261,6 +267,28 @@ index 0000000..5a69a7d
 +  const context = calls.find((c) => c.url.includes('/api/auth/stalwart-context'));
 +  expect(JSON.parse(context!.body)).toMatchObject({ authHeader: 'Bearer new-at', slot: 2 });
 +  expect(useAuthStore.getState().accessToken).toBe('new-at');
++  expect(logout).not.toHaveBeenCalled();
++  // and the hold is released: the next refresh is a refresh of its own
++  refreshStatus = 200;
++  await useAuthStore.getState().refreshAccessToken();
++  expect(refreshes()).toHaveLength(1);
++});
++
++it('lets a refresh already running finish first, then holds the later ones', async () => {
++  signedIn('oauth');
++  refreshStatus = 200; // the old token is still good until the change is applied
++  const before = useAuthStore.getState().refreshAccessToken();
++  let during: Promise<string | null> | undefined;
++  const change = vi.fn(async () => {
++    // The earlier refresh ends while the change is in flight (its cleanup must not drop the hold) ...
++    await before;
++    refreshStatus = 401; // ... and from here on the old refresh token is revoked
++    during = useAuthStore.getState().refreshAccessToken();
++  });
++  await useAuthStore.getState().keepTokenSessionThrough(change, 'new-pw', '123456');
++  expect(await before).toBe('pre-at');
++  expect(await during).toBe('new-at');
++  expect(refreshes()).toHaveLength(1); // only the one that started before the change
 +  expect(logout).not.toHaveBeenCalled();
 +});
 +
@@ -350,7 +378,7 @@ index bc2abd7..fb0006c 100644
        // so the next request does not bounce the user to the login page.
        try {
 diff --git a/stores/auth-store.ts b/stores/auth-store.ts
-index 10e3813..fb1fe15 100644
+index 10e3813..0f90b6c 100644
 --- a/stores/auth-store.ts
 +++ b/stores/auth-store.ts
 @@ -102,6 +102,15 @@ interface AuthState {
@@ -408,7 +436,7 @@ index 10e3813..fb1fe15 100644
                const tokenRes = await exchangePasswordForTokens({
                  serverUrl, username, password, totp, slot: cookieSlot, redirectUri, rememberMe: !!rememberMe,
                });
-@@ -2774,6 +2788,53 @@ export const useAuthStore = create<AuthState>()(
+@@ -2774,6 +2788,59 @@ export const useAuthStore = create<AuthState>()(
          }
        },
  
@@ -444,7 +472,13 @@ index 10e3813..fb1fe15 100644
 +          }
 +        };
 +        // Hold refreshes BEFORE the change starts: the old tokens may be revoked
-+        // the moment the server applies it, before its response arrives.
++        // the moment the server applies it, before its response arrives. A
++        // refresh already running would clear the hold when it ends, so it
++        // finishes first; any later one joins the hold.
++        for (let running = refreshPromise ?? refreshPromises.get(account.id); running;
++          running = refreshPromise ?? refreshPromises.get(account.id)) {
++          await running;
++        }
 +        let settle!: (token: string | null) => void;
 +        const held = new Promise<string | null>((resolve) => { settle = resolve; });
 +        refreshPromise = held;
