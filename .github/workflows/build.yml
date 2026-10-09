@@ -135,8 +135,8 @@ jobs:
             || { echo "::error::the restore still signs out on a timeout or CORS_ERROR"; exit 1; }
           # 0011: no section of the Security page depends on how the session signed in, and a password
           # change renews a token session.
-          ! grep -n 'isOAuth' components/settings/account-security-settings.tsx \
-            && grep -qF 'renewTokenSession(newPassword' stores/account-security-store.ts \
+          ! grep -nE "isOAuth|authMode === 'oauth'" components/settings/account-security-settings.tsx \
+            && grep -qF 'keepTokenSessionThrough(' stores/account-security-store.ts \
             || { echo "::error::a token session's Security page still differs, or a password change does not renew it"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0

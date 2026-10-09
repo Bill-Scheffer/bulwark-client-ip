@@ -1,10 +1,10 @@
 diff --git a/components/settings/__tests__/account-security-token-session.test.tsx b/components/settings/__tests__/account-security-token-session.test.tsx
 new file mode 100644
-index 0000000..f781fcb
+index 0000000..188e875
 --- /dev/null
 +++ b/components/settings/__tests__/account-security-token-session.test.tsx
-@@ -0,0 +1,35 @@
-+import { render } from '@testing-library/react';
+@@ -0,0 +1,43 @@
++import { render, waitFor } from '@testing-library/react';
 +import { describe, it, expect, vi, beforeEach } from 'vitest';
 +import { AccountSecuritySettings } from '../account-security-settings';
 +import { useAccountSecurityStore } from '@/stores/account-security-store';
@@ -37,6 +37,14 @@ index 0000000..f781fcb
 +    expect(text).toContain('totp.section_title');
 +    expect(text).not.toContain('email_client.');
 +    expect(text).not.toContain('link_device.');
++  });
++
++  it('fetches the account details the sections show, once the server is detected', async () => {
++    const probe = vi.fn(async () => { useAccountSecurityStore.setState({ isStalwart: true }); return true; });
++    useAccountSecurityStore.setState({ isStalwart: null, probe });
++    useAuthStore.setState({ isAuthenticated: true, authMode, client: {} as never });
++    render(<AccountSecuritySettings />);
++    await waitFor(() => expect(fetchAll).toHaveBeenCalledOnce());
 +  });
 +});
 diff --git a/components/settings/account-security-settings.tsx b/components/settings/account-security-settings.tsx
@@ -154,20 +162,20 @@ index ccc5220..35774b1 100644
              <div>
                
 diff --git a/stores/__tests__/account-security-store.test.ts b/stores/__tests__/account-security-store.test.ts
-index 7e8454d..d750815 100644
+index 7e8454d..3908fac 100644
 --- a/stores/__tests__/account-security-store.test.ts
 +++ b/stores/__tests__/account-security-store.test.ts
 @@ -10,11 +10,13 @@ vi.mock('@/lib/stalwart/jmap-passthrough', () => ({
  }));
  
  const updateBasicPassword = vi.fn(async (_password: string) => {});
-+const renewTokenSession = vi.fn(async (_password: string, _otpCode?: string) => {});
++const keepTokenSessionThrough = vi.fn(async (change: () => Promise<void>, _password: string, _otpCode?: string) => change());
  
  vi.mock('@/stores/auth-store', () => ({
    useAuthStore: {
      getState: () => ({
        updateBasicPassword,
-+      renewTokenSession,
++      keepTokenSessionThrough,
        client: {
          getAccountId: () => 'acc-primary',
          hasAccountCapability: (cap: string) => cap === 'urn:stalwart:jmap',
@@ -176,22 +184,23 @@ index 7e8454d..d750815 100644
        await useAccountSecurityStore.getState().changePassword('old', 'new', ' 123456 ');
        expect(updateBasicPassword).toHaveBeenCalledWith('new');
 +      // A token session is signed in again with the code the change used.
-+      expect(renewTokenSession).toHaveBeenCalledWith('new', '123456');
++      expect(keepTokenSessionThrough).toHaveBeenCalledWith(expect.any(Function), 'new', '123456');
  
        const args = mockedJmap.mock.calls[0][0][0][1];
        expect(args.update.singleton).toEqual({ currentSecret: 'old', secret: 'new', 'otpAuth/otpCode': '123456' });
 diff --git a/stores/__tests__/auth-store-token-password.test.ts b/stores/__tests__/auth-store-token-password.test.ts
 new file mode 100644
-index 0000000..7e94e73
+index 0000000..5a69a7d
 --- /dev/null
 +++ b/stores/__tests__/auth-store-token-password.test.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,109 @@
 +import { beforeEach, expect, it, vi } from 'vitest';
 +
-+// A two-step sign-in is a token session, and Stalwart revokes its access and
-+// refresh tokens when the password changes (measured on v0.16.25: both 401/400
-+// right after the change). renewTokenSession signs in again with the new
-+// password and the code the change was confirmed with, so the user stays in.
++// Patch 0011. A two-step sign-in is a token session, and Stalwart revokes its
++// access and refresh tokens when the password changes (measured: 401 and 400
++// right after). keepTokenSessionThrough runs the change, then signs in again
++// with the new password and the confirming code, and holds token refreshes
++// until it has: a refresh spending the revoked token would sign the user out.
 +vi.mock('@/lib/jmap/client', () => {
 +  class JMAPClient {}
 +  class RateLimitError extends Error {}
@@ -208,21 +217,25 @@ index 0000000..7e94e73
 +  isConnected: true, hasError: false, lastLoginAt: 1, avatarColor: '#000', isDefault: true,
 +};
 +const updateAccessToken = vi.fn();
-+let exchanges: Array<Record<string, unknown>> = [];
++const logout = vi.fn(async () => {});
++let calls: Array<{ url: string; method: string; body: string }> = [];
 +let exchangeStatus = 200;
 +
 +beforeEach(() => {
-+  exchanges = [];
++  calls = [];
 +  exchangeStatus = 200;
 +  updateAccessToken.mockReset();
++  logout.mockReset();
 +  vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
 +    const url = String(input);
++    calls.push({ url, method: init?.method ?? 'GET', body: String(init?.body ?? '') });
 +    if (url.includes('/api/auth/totp-token-exchange')) {
-+      exchanges.push(JSON.parse(String(init?.body)));
 +      return exchangeStatus === 200
 +        ? new Response(JSON.stringify({ access_token: 'new-at', expires_in: 3600, has_refresh_token: true }), { status: 200 })
 +        : new Response(JSON.stringify({ error: 'invalid_credentials' }), { status: exchangeStatus });
 +    }
++    // The revoked refresh token: the route answers 401, which signs the session out.
++    if (url.includes('/api/auth/token')) return new Response('{}', { status: 401 });
 +    return new Response('{}', { status: 200 });
 +  }));
 +});
@@ -230,71 +243,133 @@ index 0000000..7e94e73
 +const signedIn = (authMode: 'oauth' | 'basic') => {
 +  useAccountStore.setState({ accounts: [{ ...A, authMode }] as never, activeAccountId: A.id, defaultAccountId: A.id });
 +  useAuthStore.setState({
-+    isAuthenticated: true, activeAccountId: A.id, accessToken: 'revoked-at',
++    isAuthenticated: true, activeAccountId: A.id, accessToken: 'revoked-at', logout,
 +    client: { updateAccessToken } as never,
 +  });
 +};
++const exchanges = () => calls.filter((c) => c.url.includes('/api/auth/totp-token-exchange')).map((c) => JSON.parse(c.body));
++const refreshes = () => calls.filter((c) => c.url.includes('/api/auth/token?'));
 +
 +it('signs a token session in again with the new password and the confirming code', async () => {
 +  signedIn('oauth');
-+  await useAuthStore.getState().renewTokenSession('new-pw', '123456');
-+  expect(exchanges).toHaveLength(1);
-+  expect(exchanges[0]).toMatchObject({ serverUrl: A.serverUrl, username: A.username, password: 'new-pw', totp: '123456', slot: 2 });
++  const change = vi.fn(async () => {});
++  await useAuthStore.getState().keepTokenSessionThrough(change, 'new-pw', '123456');
++  expect(change).toHaveBeenCalledOnce();
++  expect(exchanges()).toEqual([expect.objectContaining({ serverUrl: A.serverUrl, username: A.username, password: 'new-pw', totp: '123456', slot: 2 })]);
 +  expect(updateAccessToken).toHaveBeenCalledWith('new-at');
++  // The server-side helpers (the Security page's calls) authenticate with the new token too.
++  const context = calls.find((c) => c.url.includes('/api/auth/stalwart-context'));
++  expect(JSON.parse(context!.body)).toMatchObject({ authHeader: 'Bearer new-at', slot: 2 });
 +  expect(useAuthStore.getState().accessToken).toBe('new-at');
++  expect(logout).not.toHaveBeenCalled();
 +});
 +
-+it('leaves a password (Basic) session to updateBasicPassword', async () => {
-+  signedIn('basic');
-+  await useAuthStore.getState().renewTokenSession('new-pw', '123456');
-+  expect(exchanges).toHaveLength(0);
-+  expect(updateAccessToken).not.toHaveBeenCalled();
++it('makes a refresh asked for during the change wait for the new sign-in, not spend the revoked token', async () => {
++  signedIn('oauth');
++  let during: Promise<string | null> | undefined;
++  await useAuthStore.getState().keepTokenSessionThrough(async () => {
++    // A request that hit the revoked token (a push reconnect, a poll) asks for a refresh now.
++    during = useAuthStore.getState().refreshAccessToken();
++  }, 'new-pw', '123456');
++  expect(await during).toBe('new-at');
++  expect(refreshes()).toHaveLength(0);
++  expect(logout).not.toHaveBeenCalled();
 +});
 +
-+it('throws, keeping nothing, when the new sign-in is refused', async () => {
++it('ends the session as expired when the new sign-in is refused, rather than at the next request', async () => {
 +  signedIn('oauth');
 +  exchangeStatus = 401;
-+  await expect(useAuthStore.getState().renewTokenSession('new-pw', '000000')).rejects.toThrow('401');
++  await useAuthStore.getState().keepTokenSessionThrough(async () => {}, 'new-pw', '000000');
 +  expect(updateAccessToken).not.toHaveBeenCalled();
-+  expect(useAuthStore.getState().accessToken).toBe('revoked-at');
++  expect(logout).toHaveBeenCalledWith({ endProviderSession: false });
++});
++
++it('leaves the session alone and releases refreshes when the change itself is refused', async () => {
++  signedIn('oauth');
++  await expect(useAuthStore.getState().keepTokenSessionThrough(async () => {
++    throw new Error('Current secret is incorrect.');
++  }, 'new-pw', '123456')).rejects.toThrow('Current secret is incorrect.');
++  expect(exchanges()).toHaveLength(0);
++  expect(logout).not.toHaveBeenCalled();
++  await useAuthStore.getState().refreshAccessToken();
++  expect(refreshes()).toHaveLength(1);
++});
++
++it('just runs the change for a password (Basic) session', async () => {
++  signedIn('basic');
++  const change = vi.fn(async () => {});
++  await useAuthStore.getState().keepTokenSessionThrough(change, 'new-pw', '123456');
++  expect(change).toHaveBeenCalledOnce();
++  expect(exchanges()).toHaveLength(0);
++  expect(updateAccessToken).not.toHaveBeenCalled();
 +});
 diff --git a/stores/account-security-store.ts b/stores/account-security-store.ts
-index bc2abd7..1163a37 100644
+index bc2abd7..fb0006c 100644
 --- a/stores/account-security-store.ts
 +++ b/stores/account-security-store.ts
-@@ -601,10 +601,12 @@ export const useAccountSecurityStore = create<AccountSecurityState>()((set, get)
-         ],
-       ]);
-       requireAccountPasswordUpdate(responses, 'Failed to change password');
--      // The session still authenticates with the old password; switch it over
--      // so the next request does not bounce the user to the login page.
-+      // The session still authenticates with the old password (Basic), or with
-+      // tokens the server revoked on the change (a token session); switch it
-+      // over so the next request does not bounce the user to the login page.
+@@ -584,23 +584,26 @@ export const useAccountSecurityStore = create<AccountSecurityState>()((set, get)
+     set({ isSaving: true, error: null });
+     try {
+       const accountId = getPrimaryAccountId();
+-      const responses = await stalwartJmap([
+-        [
+-          'x:AccountPassword/set',
+-          {
+-            accountId,
+-            update: {
+-              singleton: {
+-                currentSecret: currentPassword,
+-                secret: newPassword,
+-                ...otpCodePatch(otpCode),
++      // A token session's tokens do not survive the change; this keeps it signed in.
++      await useAuthStore.getState().keepTokenSessionThrough(async () => {
++        const responses = await stalwartJmap([
++          [
++            'x:AccountPassword/set',
++            {
++              accountId,
++              update: {
++                singleton: {
++                  currentSecret: currentPassword,
++                  secret: newPassword,
++                  ...otpCodePatch(otpCode),
++                },
+               },
+             },
+-          },
+-          '0',
+-        ],
+-      ]);
+-      requireAccountPasswordUpdate(responses, 'Failed to change password');
++            '0',
++          ],
++        ]);
++        requireAccountPasswordUpdate(responses, 'Failed to change password');
++      }, newPassword, otpCode?.trim() || undefined);
+       // The session still authenticates with the old password; switch it over
+       // so the next request does not bounce the user to the login page.
        try {
-         await useAuthStore.getState().updateBasicPassword(newPassword);
-+        await useAuthStore.getState().renewTokenSession(newPassword, otpCode?.trim() || undefined);
-       } catch (error) {
-         debug.warn('auth', 'Password changed, but the session could not switch to it:', error);
-       }
 diff --git a/stores/auth-store.ts b/stores/auth-store.ts
-index 10e3813..4b0fec2 100644
+index 10e3813..fb1fe15 100644
 --- a/stores/auth-store.ts
 +++ b/stores/auth-store.ts
-@@ -102,6 +102,12 @@ interface AuthState {
+@@ -102,6 +102,15 @@ interface AuthState {
     * session still hold the old one, which the server now refuses.
     */
    updateBasicPassword: (newPassword: string) => Promise<void>;
 +  /**
-+   * The same for a token session (a two-step sign-in): Stalwart revokes the
-+   * session's access and refresh tokens when the password changes, so sign in
-+   * again with the new password and the code the change was confirmed with.
++   * Run a password change so a token session (a two-step sign-in) survives it.
++   * Stalwart revokes the session's access and refresh tokens when the password
++   * changes, so the session signs in again with the new password and the code
++   * the change was confirmed with. Until it has, token refreshes wait for that
++   * sign-in: one spending the revoked refresh token would sign the user out.
++   * Any other session just runs `change`.
 +   */
-+  renewTokenSession: (newPassword: string, otpCode?: string) => Promise<void>;
++  keepTokenSessionThrough: (change: () => Promise<void>, newPassword: string, otpCode?: string) => Promise<void>;
    refreshIdentities: () => Promise<void>;
    getClientForAccount: (accountId: string) => JMAPClient | undefined;
    getAllConnectedClients: () => Map<string, JMAPClient>;
-@@ -369,6 +375,20 @@ function liteErrorStatus(err: LiteLoginError): number {
+@@ -369,6 +378,20 @@ function liteErrorStatus(err: LiteLoginError): number {
    }
  }
  
@@ -315,7 +390,7 @@ index 10e3813..4b0fec2 100644
  /** POST /api/auth/totp-token-exchange - password (+ optional TOTP) to bearer tokens for `slot`. */
  async function exchangePasswordForTokens(params: {
    serverUrl: string;
-@@ -1254,16 +1274,7 @@ export const useAuthStore = create<AuthState>()(
+@@ -1254,16 +1277,7 @@ export const useAuthStore = create<AuthState>()(
              // rotation, unlike basic auth which embeds the ~30s code per request.
              let bearerToken: string | null = null;
              try {
@@ -333,25 +408,55 @@ index 10e3813..4b0fec2 100644
                const tokenRes = await exchangePasswordForTokens({
                  serverUrl, username, password, totp, slot: cookieSlot, redirectUri, rememberMe: !!rememberMe,
                });
-@@ -2774,6 +2785,23 @@ export const useAuthStore = create<AuthState>()(
+@@ -2774,6 +2788,53 @@ export const useAuthStore = create<AuthState>()(
          }
        },
  
-+      renewTokenSession: async (newPassword, otpCode) => {
++      keepTokenSessionThrough: async (change, newPassword, otpCode) => {
 +        const { client, activeAccountId } = get();
 +        const account = activeAccountId ? useAccountStore.getState().getAccountById(activeAccountId) : undefined;
-+        if (!client || !account || account.authMode !== 'oauth') return;
-+        const slot = account.cookieSlot ?? 0;
-+        const res = await exchangePasswordForTokens({
-+          serverUrl: account.serverUrl, username: account.username, password: newPassword, totp: otpCode,
-+          slot, redirectUri: tokenLoginRedirectUri(), rememberMe: !!account.rememberMe,
-+        });
-+        if (!res.ok) throw new Error(`Token sign-in with the new password failed (${res.status})`);
-+        const { access_token, expires_in } = await res.json();
-+        client.updateAccessToken(access_token);
-+        await syncStalwartAuthContext(account.serverUrl, account.username, `Bearer ${access_token}`, slot);
-+        set({ accessToken: access_token, tokenExpiresAt: Date.now() + expires_in * 1000 });
-+        scheduleRefresh(expires_in, get().refreshAccessToken, account.id);
++        if (!client || !account || account.authMode !== 'oauth') return change();
++        const slot = account.cookieSlot;
++        const signInAgain = async (): Promise<string | null> => {
++          try {
++            const res = await trackSessionWrite(slot, () => exchangePasswordForTokens({
++              serverUrl: account.serverUrl, username: account.username, password: newPassword, totp: otpCode,
++              slot, redirectUri: tokenLoginRedirectUri(), rememberMe: account.rememberMe,
++            }));
++            if (!res.ok) throw new Error(`token sign-in with the new password failed (${res.status})`);
++            const { access_token, expires_in } = await res.json();
++            // Signed out while the sign-in was in flight: nothing to keep alive.
++            if (closingSlots.has(slot)) return null;
++            client.updateAccessToken(access_token);
++            await syncStalwartAuthContext(account.serverUrl, account.username, `Bearer ${access_token}`, slot);
++            set({ accessToken: access_token, tokenExpiresAt: Date.now() + expires_in * 1000 });
++            resetRefreshBackoff(account.id);
++            scheduleRefresh(expires_in, get().refreshAccessToken, account.id);
++            return access_token;
++          } catch (error) {
++            // The password did change, and the session's tokens went with it:
++            // end the session now, as an expired one, not at the next request.
++            debug.warn('auth', 'Password changed, but the session could not sign in with it:', error);
++            resetRefreshBackoff(account.id);
++            markSessionExpired();
++            get().logout({ endProviderSession: false });
++            return null;
++          }
++        };
++        // Hold refreshes BEFORE the change starts: the old tokens may be revoked
++        // the moment the server applies it, before its response arrives.
++        let settle!: (token: string | null) => void;
++        const held = new Promise<string | null>((resolve) => { settle = resolve; });
++        refreshPromise = held;
++        refreshPromises.set(account.id, held);
++        try {
++          await change();
++          settle(await signInAgain());
++        } finally {
++          settle(null); // a refused change: waiting refreshes get nothing, as a failed refresh would
++          if (refreshPromise === held) refreshPromise = null;
++          if (refreshPromises.get(account.id) === held) refreshPromises.delete(account.id);
++        }
 +      },
 +
        syncIdentities: () => {
