@@ -164,6 +164,17 @@ refused change, a password session), `components/settings/__tests__/account-secu
 (both session kinds render and load the sections) and one new assertion in
 `stores/__tests__/account-security-store.test.ts`. On unpatched 1.11.2 the token-session cases fail.
 
+**Known limits, accepted at review.**
+- **Code reuse.** The re-sign-in reuses the confirming code. If the server ever refuses a code a second time,
+  a password change ends the session as expired.
+- **The push preview.** Its server-side token renewal (`/api/push/preview`) cannot see the client's hold. A
+  preview that renewed the session in the same second as the change can put the revoked tokens back in the
+  slot, and the next refresh then ends the session as expired.
+- **The global single-flight.** During the hold it can hand the new token to a non-active account's client,
+  as upstream's own single-flight already can.
+- **A failed response.** A change whose response fails on the network after the server applied it is treated
+  as refused, and the session ends at the next refresh.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
