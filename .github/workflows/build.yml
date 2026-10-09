@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with ten patches:
+# Builds Bulwark from its own release source with eleven patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -35,6 +35,12 @@
 #     remembered sign-in. The restore signed the user out on a request timeout, or on a fetch that
 #     failed while a re-probe got through (what a load balancer switching origins produces); both are
 #     now treated as the outage they are. A real rejection still signs out.
+#   0011-token-session-keeps-account-security.patch: a two-step sign-in (a token session) shows Change
+#     Password, Display Name and Two-Factor Authentication, as a password sign-in does; upstream hid them,
+#     so a two-step user could not change their password or turn two-step off (Stalwart accepts all three
+#     on the bearer token, measured). After a password change, which revokes the session's tokens, the
+#     session signs in again with the new password and the confirming code. Email Client Setup and Link
+#     Mobile App (for upstream's own app and JMAP clients, which this deployment does not offer) are gone.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -58,7 +64,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.11
+  VERSION: 1.11.2-clientip.12
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -99,7 +105,8 @@ jobs:
                    ../patch/patches/0007-push-preview-restores-oauth-session.patch \
                    ../patch/patches/0008-files-no-stability-banner.patch \
                    ../patch/patches/0009-files-upload-errors-say-why.patch \
-                   ../patch/patches/0010-restore-keeps-session-through-outage.patch; do
+                   ../patch/patches/0010-restore-keeps-session-through-outage.patch \
+                   ../patch/patches/0011-token-session-keeps-account-security.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -111,7 +118,10 @@ jobs:
             '?? lib/__tests__/pwa-icon-badge.test.ts' \
             ' M app/api/auth/session/route.ts' ' M lib/stalwart/auth-context.ts' '?? lib/__tests__/auth-context-restore.test.ts' \
             ' M components/files/files-app.tsx' \
-            ' M stores/auth-store.ts' '?? stores/__tests__/auth-store-restore-outage.test.ts' | LC_ALL=C sort | tr '\n' '|')
+            ' M stores/auth-store.ts' '?? stores/__tests__/auth-store-restore-outage.test.ts' \
+            ' M components/settings/account-security-settings.tsx' ' M stores/account-security-store.ts' \
+            ' M stores/__tests__/account-security-store.test.ts' '?? stores/__tests__/auth-store-token-password.test.ts' \
+            '?? components/settings/__tests__/account-security-token-session.test.tsx' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
           # 0008: the Files page renders no stability banner.
           ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
@@ -123,6 +133,11 @@ jobs:
           grep -qF 'if (error instanceof RequestTimeoutError) return true;' stores/auth-store.ts \
             && grep -qF "if (error instanceof Error && error.message === 'CORS_ERROR') return true;" stores/auth-store.ts \
             || { echo "::error::the restore still signs out on a timeout or CORS_ERROR"; exit 1; }
+          # 0011: no section of the Security page depends on how the session signed in, and a password
+          # change renews a token session.
+          ! grep -n 'isOAuth' components/settings/account-security-settings.tsx \
+            && grep -qF 'renewTokenSession(newPassword' stores/account-security-store.ts \
+            || { echo "::error::a token session's Security page still differs, or a password change does not renew it"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
@@ -138,7 +153,9 @@ jobs:
             lib/__tests__/pwa-icon-badge.test.ts lib/__tests__/domain-branding.test.ts lib/__tests__/branding-asset.test.ts \
             lib/__tests__/auth-context-restore.test.ts lib/__tests__/impersonation-session.test.ts \
             lib/__tests__/auth-routes-credential-check.test.ts lib/__tests__/settings-route-account-key.test.ts \
-            lib/__tests__/wopi-token-not-a-session.test.ts stores/__tests__/auth-store-restore-outage.test.ts
+            lib/__tests__/wopi-token-not-a-session.test.ts stores/__tests__/auth-store-restore-outage.test.ts \
+            stores/__tests__/auth-store-token-password.test.ts stores/__tests__/account-security-store.test.ts \
+            components/settings/__tests__/account-security-token-session.test.tsx
           npx tsc --noEmit -p tsconfig.json
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0

@@ -1,0 +1,582 @@
+diff --git a/components/settings/__tests__/account-security-token-session.test.tsx b/components/settings/__tests__/account-security-token-session.test.tsx
+new file mode 100644
+index 0000000..7a8ec9f
+--- /dev/null
++++ b/components/settings/__tests__/account-security-token-session.test.tsx
+@@ -0,0 +1,40 @@
++import { render } from '@testing-library/react';
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++import { AccountSecuritySettings } from '../account-security-settings';
++import { useAccountSecurityStore } from '@/stores/account-security-store';
++import { useAuthStore } from '@/stores/auth-store';
++
++// A two-step sign-in is a token session (authMode 'oauth'). Upstream hid the
++// password, display-name and two-factor sections from it, so a two-step user
++// could not change their password or turn two-step off; Stalwart accepts all
++// three on the session's bearer token (measured on v0.16.25). It also showed
++// two sections for upstream's own mobile app and JMAP clients, which this
++// deployment does not offer.
++vi.mock('next-intl', () => ({
++  useTranslations: () => Object.assign((key: string) => key, { raw: (key: string) => key }),
++}));
++vi.mock('../settings-section', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('../settings-section')>()),
++  SettingsSection: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
++}));
++vi.mock('@/lib/stalwart/jmap-passthrough', () => ({ stalwartJmap: vi.fn(async () => []), requireResult: () => ({}) }));
++
++const fetchAll = vi.fn(async () => {});
++
++beforeEach(() => {
++  fetchAll.mockClear();
++  useAccountSecurityStore.setState({ isStalwart: true, isProbing: false, fetchAll, otpEnabled: true });
++});
++
++describe.each(['oauth', 'basic'] as const)('a %s session', (authMode) => {
++  it('shows Change Password, Display Name and Two-Factor, and no upstream-app sections', () => {
++    useAuthStore.setState({ isAuthenticated: true, authMode, client: {} as never });
++    const { container } = render(<AccountSecuritySettings />);
++    const text = container.textContent ?? '';
++    expect(text).toContain('password.title');
++    expect(text).toContain('display_name.label');
++    expect(text).toContain('totp.section_title');
++    expect(text).not.toContain('email_client.');
++    expect(text).not.toContain('link_device.');
++  });
++});
+diff --git a/components/settings/account-security-settings.tsx b/components/settings/account-security-settings.tsx
+index ccc5220..a234406 100644
+--- a/components/settings/account-security-settings.tsx
++++ b/components/settings/account-security-settings.tsx
+@@ -1,18 +1,15 @@
+ 'use client';
+ 
+-import { useState, useEffect, useMemo, useCallback } from 'react';
+-import { useParams } from 'next/navigation';
++import { useState, useEffect } from 'react';
+ import { useTranslations } from 'next-intl';
+ import QRCode from 'qrcode';
+ import * as OTPAuth from 'otpauth';
+-import { Shield, Key, Smartphone, Lock, Trash2, Plus, Eye, EyeOff, Copy, Check, Loader2, Monitor, Terminal, QrCode, Unlock } from '@/components/icons';
++import { Shield, Key, Smartphone, Lock, Trash2, Plus, Eye, EyeOff, Copy, Check, Loader2, Terminal, Unlock } from '@/components/icons';
+ import { Button } from '@/components/ui/button';
+ import { Input } from '@/components/ui/input';
+ import { SettingsSection, SettingItem, ToggleSwitch } from './settings-section';
+ import { useAccountSecurityStore, type AppPasswordInfo, type ApiKeyInfo, type AppCredentialInput } from '@/stores/account-security-store';
+ import { useAuthStore } from '@/stores/auth-store';
+-import { useAccountStore } from '@/stores/account-store';
+-import { apiFetch, getPathPrefix } from '@/lib/browser-navigation';
+ import { toast } from '@/stores/toast-store';
+ import { cn } from '@/lib/utils';
+ import { sanitizeI18nHtml } from '@/lib/email-sanitization';
+@@ -864,200 +861,10 @@ function PublicKeysSection() {
+   );
+ }
+ 
+-function EmailClientSection() {
+-  const t = useTranslations('settings.security');
+-  const { client } = useAuthStore();
+-  const [copied, setCopied] = useState(false);
+-
+-  const jmapUsername = useMemo(() => client?.getUsername() || '', [client]);
+-
+-  const handleCopy = () => {
+-    navigator.clipboard.writeText(jmapUsername).then(() => {
+-      setCopied(true);
+-      setTimeout(() => setCopied(false), 2000);
+-    });
+-  };
+-
+-  return (
+-    <div className="space-y-3">
+-      <div className="flex items-center gap-2">
+-        <Monitor className="w-4 h-4 text-muted-foreground" />
+-        <h4 className="text-sm font-medium text-foreground">{t('email_client.title')}</h4>
+-      </div>
+-      <p className="text-xs text-muted-foreground">{t('email_client.description')}</p>
+-      <div className="p-3 bg-muted/70 dark:bg-muted/40 rounded-md space-y-2">
+-        <div>
+-          <label className="text-xs text-muted-foreground mb-1 block">
+-            {t('email_client.jmap_username_label')}
+-          </label>
+-          <div className="flex rounded-lg">
+-            <input
+-              type="text"
+-              readOnly
+-              value={jmapUsername}
+-              className="py-2 px-3 block w-full bg-background border border-border border-e-transparent rounded-s-lg text-sm text-foreground focus:z-10 focus:border-ring focus:ring-ring"
+-            />
+-            <button
+-              type="button"
+-              onClick={handleCopy}
+-              className="h-[38px] px-3 shrink-0 inline-flex items-center gap-1.5 rounded-e-lg border border-border bg-muted text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+-            >
+-              {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
+-              {copied ? t('email_client.copied') : t('email_client.copy')}
+-            </button>
+-          </div>
+-        </div>
+-        <p className="text-xs text-muted-foreground pt-1">{t('email_client.password_instructions')}</p>
+-      </div>
+-    </div>
+-  );
+-}
+-
+-// Cross-device QR login. A signed-in (OAuth/SSO) session mints a short-lived
+-// pairing code via /api/auth/pair/create; we render it as a QR that the mobile
+-// app scans to sign in without re-typing credentials. The QR payload carries
+-// only the server URL and the one-time code — never tokens.
+-function LinkDeviceSection() {
+-  const t = useTranslations('settings.security');
+-  const params = useParams();
+-  const locale = params.locale as string;
+-  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+-  const [remaining, setRemaining] = useState(0);
+-  const [loading, setLoading] = useState(false);
+-  const [error, setError] = useState<string | null>(null);
+-  const [hasGenerated, setHasGenerated] = useState(false);
+-
+-  // Tick the countdown down to zero, then drop the (now useless) QR so the
+-  // user is nudged to generate a fresh one.
+-  useEffect(() => {
+-    if (remaining <= 0) {
+-      setQrDataUrl(null);
+-      return;
+-    }
+-    const timer = setInterval(() => setRemaining((r) => Math.max(0, r - 1)), 1000);
+-    return () => clearInterval(timer);
+-  }, [remaining]);
+-
+-  // Send the user to the IdP for a fresh login (prompt=login). On return the
+-  // callback page sets the pairing re-auth proof and bounces back here, where
+-  // the resume effect below re-runs generate().
+-  const startReauth = useCallback(async () => {
+-    try {
+-      sessionStorage.setItem('pair_reauth_resume', '1');
+-    } catch { /* sessionStorage unavailable */ }
+-    const prefix = getPathPrefix(locale);
+-    const redirectUri = `${window.location.origin}${prefix}/${locale}/auth/callback`;
+-    // The slot lets the server re-authenticate against this account's own
+-    // server entry (its IdP), read from the slot's server cookie.
+-    const slot = useAccountStore.getState().getActiveAccount()?.cookieSlot ?? 0;
+-    const res = await apiFetch('/api/auth/sso/start', {
+-      method: 'POST',
+-      headers: { 'Content-Type': 'application/json' },
+-      credentials: 'include',
+-      body: JSON.stringify({ redirect_uri: redirectUri, locale, purpose: 'reauth', slot }),
+-    });
+-    if (!res.ok) {
+-      setError(t('link_device.error'));
+-      return;
+-    }
+-    const { authorize_url } = await res.json();
+-    window.location.href = authorize_url;
+-  }, [locale, t]);
+-
+-  // `fromResume` guards against a redirect loop: if we just completed re-auth
+-  // and pair/create still demands it, surface an error instead of bouncing to
+-  // the IdP again.
+-  const generate = useCallback(async (fromResume = false) => {
+-    setLoading(true);
+-    setError(null);
+-    try {
+-      // Pair the account whose session cookie we'll actually refresh — the
+-      // active account's slot.
+-      const slot = useAccountStore.getState().getActiveAccount()?.cookieSlot ?? 0;
+-      const res = await apiFetch('/api/auth/pair/create', {
+-        method: 'POST',
+-        headers: { 'Content-Type': 'application/json' },
+-        credentials: 'include',
+-        body: JSON.stringify({ slot }),
+-      });
+-      if (!res.ok) {
+-        const errBody = await res.json().catch(() => null);
+-        if (res.status === 401 && errBody?.error === 'reauth_required' && !fromResume) {
+-          await startReauth();
+-          return;
+-        }
+-        setError(t('link_device.error'));
+-        return;
+-      }
+-      const data = await res.json();
+-      const code = data.pairing_code as string;
+-      const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 120;
+-      // The phone redeems the code against THIS webmail (where the pairing
+-      // record lives), so the QR carries the webmail base — origin plus any
+-      // mount prefix — not the JMAP server URL. The JMAP server_url comes back
+-      // in the redeem response.
+-      const webmailBase = `${window.location.origin}${getPathPrefix()}`;
+-      const payload = `bulwarkmail://pair?server=${encodeURIComponent(webmailBase)}&code=${encodeURIComponent(code)}`;
+-      const dataUrl = await QRCode.toDataURL(payload, { width: 240, margin: 1 });
+-      setQrDataUrl(dataUrl);
+-      setRemaining(expiresIn);
+-      setHasGenerated(true);
+-    } catch {
+-      setError(t('link_device.error'));
+-    } finally {
+-      setLoading(false);
+-    }
+-  }, [t, startReauth]);
+-
+-  // Auto-resume after returning from the step-up re-auth round-trip.
+-  useEffect(() => {
+-    let resume = false;
+-    try {
+-      resume = sessionStorage.getItem('pair_reauth_done') === '1';
+-      if (resume) sessionStorage.removeItem('pair_reauth_done');
+-    } catch { /* sessionStorage unavailable */ }
+-    if (resume) void generate(true);
+-  }, [generate]);
+-
+-  return (
+-    <div className="space-y-3">
+-      <div className="flex items-center gap-2">
+-        <QrCode className="w-4 h-4 text-muted-foreground" />
+-        <h4 className="text-sm font-medium text-foreground">{t('link_device.title')}</h4>
+-      </div>
+-      <p className="text-xs text-muted-foreground">{t('link_device.description')}</p>
+-
+-      {qrDataUrl && remaining > 0 && (
+-        <div className="p-3 bg-muted/70 dark:bg-muted/40 rounded-md space-y-2">
+-          <div className="flex justify-center">
+-            <img src={qrDataUrl} alt="Pairing QR code" className="rounded bg-white p-2" />
+-          </div>
+-          <p className="text-xs text-muted-foreground text-center">{t('link_device.instructions')}</p>
+-          <p className="text-[11px] text-muted-foreground text-center">
+-            {t('link_device.expires_in', { seconds: remaining })}
+-          </p>
+-        </div>
+-      )}
+-
+-      {error && <p className="text-xs text-destructive">{error}</p>}
+-
+-      <Button variant="outline" size="sm" onClick={() => void generate()} disabled={loading}>
+-        {loading ? (
+-          <Loader2 className="w-3 h-3 me-1 animate-spin" />
+-        ) : (
+-          <QrCode className="w-3 h-3 me-1" />
+-        )}
+-        {hasGenerated ? t('link_device.regenerate') : t('link_device.generate')}
+-      </Button>
+-    </div>
+-  );
+-}
+-
+ export function AccountSecuritySettings() {
+   const t = useTranslations('settings.security');
+-  const { isStalwart, isProbing, probe, fetchAll, fetchAuthInfo, fetchPublicKeys, fetchCryptoInfo } = useAccountSecurityStore();
+-  const { isAuthenticated, authMode, client } = useAuthStore();
+-  const isOAuth = authMode === 'oauth';
++  const { isStalwart, isProbing, probe, fetchAll } = useAccountSecurityStore();
++  const { isAuthenticated, client } = useAuthStore();
+ 
+   // Wait for `client` before probing. On reload the persisted `isAuthenticated`
+   // flips true before the async OAuth reconnect sets `client`; probing in that
+@@ -1066,19 +873,13 @@ export function AccountSecuritySettings() {
+   // populates the session capabilities) makes the probe run with real data.
+   useEffect(() => {
+     if (isAuthenticated && client && isStalwart === null) {
++      // A token session (a two-step sign-in) reads the same account details as a
++      // password one: Stalwart accepts these calls on its bearer token.
+       probe().then((detected) => {
+-        if (detected) {
+-          if (isOAuth) {
+-            fetchAuthInfo();
+-            fetchPublicKeys();
+-            fetchCryptoInfo();
+-          } else {
+-            fetchAll();
+-          }
+-        }
++        if (detected) fetchAll();
+       });
+     }
+-  }, [isAuthenticated, client, isStalwart, probe, fetchAll, fetchAuthInfo, isOAuth, fetchPublicKeys, fetchCryptoInfo]);
++  }, [isAuthenticated, client, isStalwart, probe, fetchAll]);
+ 
+   if (isProbing) {
+     return (
+@@ -1092,25 +893,13 @@ export function AccountSecuritySettings() {
+   }
+ 
+   if (isStalwart === false) {
+-    // Even when Stalwart account-management isn't exposed (common for OAuth
+-    // sessions, whose tokens may lack the management capability), the
+-    // cross-device mobile pairing still works — it only needs the OAuth
+-    // refresh-token cookie, not `urn:stalwart:jmap`. So surface the QR linker
+-    // for OAuth sessions and show the "not available" note for the rest.
+-    // Use t.raw (not t) because the message is hand-injected HTML; passing it
++    // No QR linker here: it pairs upstream's own mobile app, which this
++    // deployment does not offer. Use t.raw (not t) because the message is hand-injected HTML; passing it
+     // through t() makes next-intl try to parse the <a> tag and throw
+     // INVALID_TAG.
+     return (
+       <SettingsSection title={t('title')} description={t('description')}>
+-        {isOAuth ? (
+-          <div className="space-y-6">
+-            <LinkDeviceSection />
+-            <div className="border-t border-border" />
+-            <div className="text-sm text-muted-foreground" dangerouslySetInnerHTML={{ __html: sanitizeI18nHtml(t.raw('not_available')) }} />
+-          </div>
+-        ) : (
+-          <div className="text-sm text-muted-foreground py-4" dangerouslySetInnerHTML={{ __html: sanitizeI18nHtml(t.raw('not_available')) }} />
+-        )}
++        <div className="text-sm text-muted-foreground py-4" dangerouslySetInnerHTML={{ __html: sanitizeI18nHtml(t.raw('not_available')) }} />
+       </SettingsSection>
+     );
+   }
+@@ -1118,36 +907,26 @@ export function AccountSecuritySettings() {
+   return (
+     <SettingsSection title={t('title')} description={t('description')}>
+       <div className="space-y-6">
+-        {!isOAuth && (
+-          <>
+-            <PasswordChangeSection />
+-            <div className="border-t border-border" />
+-            <DisplayNameSection />
+-            <div className="border-t border-border" />
+-            <div>
+-              <div className="flex items-center gap-2 mb-3">
+-                <Shield className="w-4 h-4 text-muted-foreground" />
+-                <h4 className="text-sm font-medium text-foreground">{t('totp.section_title')}</h4>
+-              </div>
+-              <TotpSection />
+-            </div>
+-            <div className="border-t border-border" />
+-          </>
+-        )}
++        {/* Every session, a two-step (token) sign-in included: Stalwart accepts
++            these changes on its bearer token. */}
++        <PasswordChangeSection />
++        <div className="border-t border-border" />
++        <DisplayNameSection />
++        <div className="border-t border-border" />
++        <div>
++          <div className="flex items-center gap-2 mb-3">
++            <Shield className="w-4 h-4 text-muted-foreground" />
++            <h4 className="text-sm font-medium text-foreground">{t('totp.section_title')}</h4>
++          </div>
++          <TotpSection />
++        </div>
++        <div className="border-t border-border" />
+ 
+         <AppPasswordsSection />
+ 
+         <div className="border-t border-border" />
+         <ApiKeysSection />
+ 
+-        {isOAuth && (
+-          <>
+-            <div className="border-t border-border" />
+-            <EmailClientSection />
+-            <div className="border-t border-border" />
+-            <LinkDeviceSection />
+-          </>
+-        )}
+             <div className="border-t border-border" />
+             <div>
+               
+diff --git a/stores/__tests__/account-security-store.test.ts b/stores/__tests__/account-security-store.test.ts
+index 7e8454d..d750815 100644
+--- a/stores/__tests__/account-security-store.test.ts
++++ b/stores/__tests__/account-security-store.test.ts
+@@ -10,11 +10,13 @@ vi.mock('@/lib/stalwart/jmap-passthrough', () => ({
+ }));
+ 
+ const updateBasicPassword = vi.fn(async (_password: string) => {});
++const renewTokenSession = vi.fn(async (_password: string, _otpCode?: string) => {});
+ 
+ vi.mock('@/stores/auth-store', () => ({
+   useAuthStore: {
+     getState: () => ({
+       updateBasicPassword,
++      renewTokenSession,
+       client: {
+         getAccountId: () => 'acc-primary',
+         hasAccountCapability: (cap: string) => cap === 'urn:stalwart:jmap',
+@@ -274,6 +276,8 @@ describe('account-security-store', () => {
+ 
+       await useAccountSecurityStore.getState().changePassword('old', 'new', ' 123456 ');
+       expect(updateBasicPassword).toHaveBeenCalledWith('new');
++      // A token session is signed in again with the code the change used.
++      expect(renewTokenSession).toHaveBeenCalledWith('new', '123456');
+ 
+       const args = mockedJmap.mock.calls[0][0][0][1];
+       expect(args.update.singleton).toEqual({ currentSecret: 'old', secret: 'new', 'otpAuth/otpCode': '123456' });
+diff --git a/stores/__tests__/auth-store-token-password.test.ts b/stores/__tests__/auth-store-token-password.test.ts
+new file mode 100644
+index 0000000..7e94e73
+--- /dev/null
++++ b/stores/__tests__/auth-store-token-password.test.ts
+@@ -0,0 +1,72 @@
++import { beforeEach, expect, it, vi } from 'vitest';
++
++// A two-step sign-in is a token session, and Stalwart revokes its access and
++// refresh tokens when the password changes (measured on v0.16.25: both 401/400
++// right after the change). renewTokenSession signs in again with the new
++// password and the code the change was confirmed with, so the user stays in.
++vi.mock('@/lib/jmap/client', () => {
++  class JMAPClient {}
++  class RateLimitError extends Error {}
++  class RequestTimeoutError extends Error {}
++  return { JMAPClient, RateLimitError, RequestTimeoutError };
++});
++
++import { useAuthStore } from '@/stores/auth-store';
++import { useAccountStore } from '@/stores/account-store';
++
++const A = {
++  id: 'alice@mail.x.test', label: 'alice@x.test', serverUrl: 'https://mail.x.test', username: 'alice@x.test',
++  authMode: 'oauth' as 'oauth' | 'basic', rememberMe: true, cookieSlot: 2, displayName: 'alice@x.test', email: 'alice@x.test',
++  isConnected: true, hasError: false, lastLoginAt: 1, avatarColor: '#000', isDefault: true,
++};
++const updateAccessToken = vi.fn();
++let exchanges: Array<Record<string, unknown>> = [];
++let exchangeStatus = 200;
++
++beforeEach(() => {
++  exchanges = [];
++  exchangeStatus = 200;
++  updateAccessToken.mockReset();
++  vi.stubGlobal('fetch', vi.fn(async (input: unknown, init?: RequestInit) => {
++    const url = String(input);
++    if (url.includes('/api/auth/totp-token-exchange')) {
++      exchanges.push(JSON.parse(String(init?.body)));
++      return exchangeStatus === 200
++        ? new Response(JSON.stringify({ access_token: 'new-at', expires_in: 3600, has_refresh_token: true }), { status: 200 })
++        : new Response(JSON.stringify({ error: 'invalid_credentials' }), { status: exchangeStatus });
++    }
++    return new Response('{}', { status: 200 });
++  }));
++});
++
++const signedIn = (authMode: 'oauth' | 'basic') => {
++  useAccountStore.setState({ accounts: [{ ...A, authMode }] as never, activeAccountId: A.id, defaultAccountId: A.id });
++  useAuthStore.setState({
++    isAuthenticated: true, activeAccountId: A.id, accessToken: 'revoked-at',
++    client: { updateAccessToken } as never,
++  });
++};
++
++it('signs a token session in again with the new password and the confirming code', async () => {
++  signedIn('oauth');
++  await useAuthStore.getState().renewTokenSession('new-pw', '123456');
++  expect(exchanges).toHaveLength(1);
++  expect(exchanges[0]).toMatchObject({ serverUrl: A.serverUrl, username: A.username, password: 'new-pw', totp: '123456', slot: 2 });
++  expect(updateAccessToken).toHaveBeenCalledWith('new-at');
++  expect(useAuthStore.getState().accessToken).toBe('new-at');
++});
++
++it('leaves a password (Basic) session to updateBasicPassword', async () => {
++  signedIn('basic');
++  await useAuthStore.getState().renewTokenSession('new-pw', '123456');
++  expect(exchanges).toHaveLength(0);
++  expect(updateAccessToken).not.toHaveBeenCalled();
++});
++
++it('throws, keeping nothing, when the new sign-in is refused', async () => {
++  signedIn('oauth');
++  exchangeStatus = 401;
++  await expect(useAuthStore.getState().renewTokenSession('new-pw', '000000')).rejects.toThrow('401');
++  expect(updateAccessToken).not.toHaveBeenCalled();
++  expect(useAuthStore.getState().accessToken).toBe('revoked-at');
++});
+diff --git a/stores/account-security-store.ts b/stores/account-security-store.ts
+index bc2abd7..1163a37 100644
+--- a/stores/account-security-store.ts
++++ b/stores/account-security-store.ts
+@@ -601,10 +601,12 @@ export const useAccountSecurityStore = create<AccountSecurityState>()((set, get)
+         ],
+       ]);
+       requireAccountPasswordUpdate(responses, 'Failed to change password');
+-      // The session still authenticates with the old password; switch it over
+-      // so the next request does not bounce the user to the login page.
++      // The session still authenticates with the old password (Basic), or with
++      // tokens the server revoked on the change (a token session); switch it
++      // over so the next request does not bounce the user to the login page.
+       try {
+         await useAuthStore.getState().updateBasicPassword(newPassword);
++        await useAuthStore.getState().renewTokenSession(newPassword, otpCode?.trim() || undefined);
+       } catch (error) {
+         debug.warn('auth', 'Password changed, but the session could not switch to it:', error);
+       }
+diff --git a/stores/auth-store.ts b/stores/auth-store.ts
+index 10e3813..4b0fec2 100644
+--- a/stores/auth-store.ts
++++ b/stores/auth-store.ts
+@@ -102,6 +102,12 @@ interface AuthState {
+    * session still hold the old one, which the server now refuses.
+    */
+   updateBasicPassword: (newPassword: string) => Promise<void>;
++  /**
++   * The same for a token session (a two-step sign-in): Stalwart revokes the
++   * session's access and refresh tokens when the password changes, so sign in
++   * again with the new password and the code the change was confirmed with.
++   */
++  renewTokenSession: (newPassword: string, otpCode?: string) => Promise<void>;
+   refreshIdentities: () => Promise<void>;
+   getClientForAccount: (accountId: string) => JMAPClient | undefined;
+   getAllConnectedClients: () => Map<string, JMAPClient>;
+@@ -369,6 +375,20 @@ function liteErrorStatus(err: LiteLoginError): number {
+   }
+ }
+ 
++/**
++ * The redirect URI a password (+ TOTP) token login names: the callback URL the
++ * OAuth client already registers, since the route needs an identical URI for
++ * the login and token-exchange steps (and a registered one when
++ * require_client_registration is on). Lite on Stalwart uses the mount root:
++ * one locale-free URI per Application for the admin to register.
++ */
++function tokenLoginRedirectUri(): string {
++  if (typeof window === 'undefined') return '';
++  return IS_LITE_STALWART
++    ? `${window.location.origin}${getPathPrefix()}/`
++    : `${window.location.origin}${getPathPrefix()}/${getLocaleFromPath()}/auth/callback`;
++}
++
+ /** POST /api/auth/totp-token-exchange - password (+ optional TOTP) to bearer tokens for `slot`. */
+ async function exchangePasswordForTokens(params: {
+   serverUrl: string;
+@@ -1254,16 +1274,7 @@ export const useAuthStore = create<AuthState>()(
+             // rotation, unlike basic auth which embeds the ~30s code per request.
+             let bearerToken: string | null = null;
+             try {
+-              // The callback URL the OAuth client already registers; the route
+-              // needs an identical redirect URI for the login + token-exchange
+-              // steps (and registered when require_client_registration is on).
+-              // Lite on Stalwart uses the mount root instead: one locale-free
+-              // URI per Application for the admin to register.
+-              const redirectUri = typeof window === 'undefined'
+-                ? ''
+-                : IS_LITE_STALWART
+-                  ? `${window.location.origin}${getPathPrefix()}/`
+-                  : `${window.location.origin}${getPathPrefix()}/${getLocaleFromPath()}/auth/callback`;
++              const redirectUri = tokenLoginRedirectUri();
+               const tokenRes = await exchangePasswordForTokens({
+                 serverUrl, username, password, totp, slot: cookieSlot, redirectUri, rememberMe: !!rememberMe,
+               });
+@@ -2774,6 +2785,23 @@ export const useAuthStore = create<AuthState>()(
+         }
+       },
+ 
++      renewTokenSession: async (newPassword, otpCode) => {
++        const { client, activeAccountId } = get();
++        const account = activeAccountId ? useAccountStore.getState().getAccountById(activeAccountId) : undefined;
++        if (!client || !account || account.authMode !== 'oauth') return;
++        const slot = account.cookieSlot ?? 0;
++        const res = await exchangePasswordForTokens({
++          serverUrl: account.serverUrl, username: account.username, password: newPassword, totp: otpCode,
++          slot, redirectUri: tokenLoginRedirectUri(), rememberMe: !!account.rememberMe,
++        });
++        if (!res.ok) throw new Error(`Token sign-in with the new password failed (${res.status})`);
++        const { access_token, expires_in } = await res.json();
++        client.updateAccessToken(access_token);
++        await syncStalwartAuthContext(account.serverUrl, account.username, `Bearer ${access_token}`, slot);
++        set({ accessToken: access_token, tokenExpiresAt: Date.now() + expires_in * 1000 });
++        scheduleRefresh(expires_in, get().refreshAccessToken, account.id);
++      },
++
+       syncIdentities: () => {
+         const identityState = useIdentityStore.getState();
+         const identities = identityState.identities;
