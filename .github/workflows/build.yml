@@ -45,7 +45,8 @@
 #     (APP_NAME) as its issuer, not 'Stalwart', so the user's authenticator app names the entry after the
 #     service they signed up for (MainThrive MAI-947).
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
-# end-to-end check against the built image passes.
+# end-to-end check against the built image passes, and only from main: a pull request runs every step
+# but the registry login and the push (MAI-1019).
 name: build
 
 on:
@@ -53,14 +54,20 @@ on:
   push:
     branches: [main]
     paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
+  # No path filter: this job is the required check on main, and a check filtered out of a pull
+  # request never reports, so that pull request could never merge.
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
   packages: write
 
+# main builds one at a time and never cancels. Each pull request has its own group, and a new push
+# cancels its older run.
 concurrency:
-  group: build
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'build' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Upstream Bulwark release, pinned by commit: a tag can move, a commit cannot.
@@ -201,13 +208,17 @@ jobs:
       - name: End-to-end, the notification badge has its own image
         run: bash patch/scripts/e2e-badge.sh "${IMAGE}:${VERSION}"
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+      # ⛔ Only from main. A pull request's ref is refs/pull/N/merge, so it never logs in or pushes; a
+      # dispatch from another branch does not publish under the release tag either.
+      - if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push, only after the end-to-end check passed
+        if: github.ref == 'refs/heads/main'
         run: |
           set -eu
           docker push "${IMAGE}:${VERSION}"
