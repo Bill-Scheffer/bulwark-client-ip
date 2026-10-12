@@ -47,7 +47,8 @@
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes. The release tag is pushed only from main; a dispatch
 # from another branch pushes branch-<short sha> instead, and a pull request runs every step but the
-# registry login and the push (MAI-1019).
+# registry login and the push (MAI-1019). A release tag is pushed once and never re-pushed, so changing
+# what is built means bumping VERSION (MAI-1021).
 name: build
 
 on:
@@ -106,6 +107,46 @@ jobs:
           tagged=$(git ls-remote https://github.com/bulwarkmail/webmail "refs/tags/${BULWARK_TAG}" | cut -f1)
           echo "tag ${BULWARK_TAG} -> ${tagged}"
           [ "$tagged" = "$BULWARK_SHA" ] || { echo "::error::${BULWARK_TAG} no longer points at ${BULWARK_SHA}"; exit 1; }
+
+      # ⛔ A release tag names one image, forever (MAI-1021). A main build used to re-push it with a new digest even
+      # when only this workflow changed, which left the digest production pins untagged, and an untagged version is
+      # the first thing a registry cleanup deletes. So a tag that already exists is never re-pushed, and a change to
+      # what goes into the image must bump VERSION; this fails a pull request that makes one without the bump. What
+      # goes in: patches/**, any other file of this repo that a step up to the image build names (patch/<path>),
+      # the env: values (the upstream commit, the push relay URL, the tag itself), and every step up to and
+      # including the image build, comments aside. The CI-only reference images and this step itself are left out.
+      # The package is public, so this reads it without logging in.
+      - name: The release tag is new, or already names this content (it is never re-pushed)
+        id: release
+        run: |
+          set -eu
+          tag="${VERSION}"
+          if ! have=$(docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{.Manifest.Digest}} {{index .Image.Config.Labels "org.opencontainers.image.revision"}}' 2>&1); then
+            case "$have" in *": not found"*) ;; *) echo "::error::cannot read ${IMAGE}:${tag}: ${have}"; exit 1 ;; esac
+            echo "${tag} is new: a main build publishes it"
+            echo publish=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          read -r digest rev <<< "$have"
+          [[ "${rev:-}" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::${IMAGE}:${tag} carries no revision label (got '${have}')"; exit 1; }
+          git -C patch fetch -q --depth=1 origin "$rev"
+          # build.yml from env: through the image build step, minus comments, the reference images and this step.
+          inputs_of() {
+            git -C patch show "$1:.github/workflows/build.yml" | awk '
+              /^env:/ { on = 1 }
+              /^      - / { if (build) exit; skip = /name: The release tag is new/; build = /name: Build with/ }
+              on && !skip && !/^[[:space:]]*(#|$)/ && !/REFERENCE_IMAGE/'
+          }
+          # This repo's files those steps name: patches/** today. A script added before the build is then covered too.
+          refs=$(inputs_of HEAD | { grep -oE '(^|[^[:alnum:]_-])patch/[[:alnum:]_./-]+' || true; } | sed -E 's#^[^p]?patch/##' | sort -u)
+          changed=$(git -C patch diff --name-only "$rev" HEAD -- patches $refs)
+          [ "$(inputs_of "$rev")" = "$(inputs_of HEAD)" ] || changed="${changed} build.yml"
+          if [ -n "$changed" ]; then
+            echo "::error::${tag} already names ${digest}, built from ${rev}, and what goes into the image changed since:" $changed "-- bump VERSION"
+            exit 1
+          fi
+          echo "${tag} already names ${digest}, built from ${rev}; nothing that goes into the image changed, so it is not re-pushed"
+          echo publish=false >> "$GITHUB_OUTPUT"
 
       - name: Apply the patches, and prove they changed exactly their files
         working-directory: bulwark
@@ -227,12 +268,18 @@ jobs:
 
       - name: Push, only after the end-to-end check passed
         if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        env:
+          PUBLISH: ${{ steps.release.outputs.publish }}
         run: |
           set -eu
           tag="${VERSION}"
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             tag="branch-${GITHUB_SHA::7}"
             docker tag "${IMAGE}:${VERSION}" "${IMAGE}:${tag}"
+          elif [ "$PUBLISH" != true ]; then
+            echo "${tag} already exists and is never re-pushed: built and checked, nothing pushed"
+            echo "### ${IMAGE}: \`${tag}\` already exists and is never re-pushed; this run built and checked, and pushed nothing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           docker push "${IMAGE}:${tag}"
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${tag}")
