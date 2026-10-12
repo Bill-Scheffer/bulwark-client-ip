@@ -214,6 +214,28 @@ Node 22 host) when 0003 was, and the same two when 0011 was (4862 passed; both f
 
 Image: `ghcr.io/bill-scheffer/bulwark-client-ip:<bulwark tag>-clientip.N`. Pin it by digest.
 
+## Builds, tags and testing a change before it merges
+
+| What runs `build` | Checks | Pushes |
+|---|---|---|
+| A pull request to `main` | every check: patches, assertions, tests, the image build, every end-to-end check | **nothing**, and it never logs in to the registry |
+| A push to `main`, or a dispatch on `main` | the same | the **release tag**: `<VERSION>`, e.g. `1.11.2-clientip.13` |
+| A dispatch from any other branch | the same | **`branch-<short sha>`** only, never the release tag |
+
+`build` is the required check on `main`, so a pull request merges only once it is green.
+
+To run a change on the cluster before it merges (a throwaway or a window test), push the branch, then:
+
+```bash
+gh workflow run build.yml -R Bill-Scheffer/bulwark-client-ip --ref <branch>
+gh run watch -R Bill-Scheffer/bulwark-client-ip "$(gh run list -R Bill-Scheffer/bulwark-client-ip -w build -b <branch> -L 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+The run's summary names the tag and the digest. Pin the image **by digest**
+(`ghcr.io/bill-scheffer/bulwark-client-ip@sha256:…`), never by the `branch-` tag, and replace it with the release
+digest once the change merges and `main` publishes it. A branch image is never released: only `main` moves the
+release tag.
+
 ## When this goes away
 
 When upstream ships an equivalent, use the upstream image again and archive this repository. The
