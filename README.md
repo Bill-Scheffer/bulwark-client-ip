@@ -175,6 +175,22 @@ refused change, a password session), `components/settings/__tests__/account-secu
 - **A failed response.** A change whose response fails on the network after the server applied it is treated
   as refused, and the session ends at the next refresh.
 
+## The authenticator entry is named after this webmail (`0012`, `clientip.13`)
+
+[`patches/0012-totp-issuer-is-app-name.patch`](patches/0012-totp-issuer-is-app-name.patch).
+Settings → Security builds the two-step enrolment's `otpauth://` URL in the browser, and upstream hardcodes its
+issuer as `'Stalwart'`. An authenticator app names the entry after the issuer, so every user who turned two-step
+on found an entry called "Stalwart" (MainThrive MAI-936, MAI-947). Stalwart takes the URL as given, so no server
+setting can change it.
+
+The patch passes the deployment's own name, `appName` from `/api/config` (the `APP_NAME` variable; MainThrive sets
+"MainThrive Mail"), and falls back to upstream's default app name, "Webmail", if the config has not loaded. An
+entry already enrolled keeps its old name until the user renames it or enrols again: the issuer is only in the URL.
+
+`components/settings/__tests__/account-security-totp-issuer.test.tsx` turns two-step on in the rendered page and
+decodes the URL it shows, as an authenticator app reads it. With the hardcoded issuer put back, all three cases
+fail.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

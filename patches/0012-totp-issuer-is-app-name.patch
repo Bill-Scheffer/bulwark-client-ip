@@ -1,0 +1,103 @@
+diff --git a/components/settings/__tests__/account-security-totp-issuer.test.tsx b/components/settings/__tests__/account-security-totp-issuer.test.tsx
+new file mode 100644
+index 0000000..5b318c5
+--- /dev/null
++++ b/components/settings/__tests__/account-security-totp-issuer.test.tsx
+@@ -0,0 +1,54 @@
++import { fireEvent, render } from '@testing-library/react';
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++import * as OTPAuth from 'otpauth';
++import { AccountSecuritySettings, generateTotp } from '../account-security-settings';
++import { useAccountSecurityStore } from '@/stores/account-security-store';
++import { useAuthStore } from '@/stores/auth-store';
++
++// Patch 0012 (README, "The authenticator entry is named after this webmail"). The issuer in the otpauth URL is
++// what an authenticator app shows as the entry's name; upstream hardcodes 'Stalwart'.
++const config = { appName: 'MainThrive Mail' };
++vi.mock('@/hooks/use-config', () => ({ useConfig: () => config }));
++vi.mock('next-intl', () => ({
++  useTranslations: () => Object.assign((key: string) => key, { raw: (key: string) => key }),
++}));
++vi.mock('../settings-section', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('../settings-section')>()),
++  SettingsSection: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
++}));
++vi.mock('@/lib/stalwart/jmap-passthrough', () => ({ stalwartJmap: vi.fn(async () => []), requireResult: () => ({}) }));
++
++beforeEach(() => {
++  config.appName = 'MainThrive Mail';
++  useAccountSecurityStore.setState({ isStalwart: true, isProbing: false, fetchAll: vi.fn(async () => {}), otpEnabled: false, isLoadingAuth: false });
++  useAuthStore.setState({ isAuthenticated: true, authMode: 'basic', client: { getUsername: () => 'alice@example.com' } as never });
++});
++
++/** Turn two-step on and decode the otpauth URL the setup shows, as an authenticator app would read it. */
++function enrol(): OTPAuth.TOTP {
++  const { container, getByText } = render(<AccountSecuritySettings />);
++  const row = getByText('totp.label').closest('div')!.parentElement!;
++  fireEvent.click(row.querySelector('button')!);
++  const shown = [...container.querySelectorAll('code')].map((c) => c.textContent ?? '').find((t) => t.startsWith('otpauth://'));
++  if (!shown) throw new Error('no otpauth URL was shown');
++  return OTPAuth.URI.parse(shown) as OTPAuth.TOTP;
++}
++
++describe('the TOTP enrolment', () => {
++  it('names the authenticator entry after the configured app name, not the mail server', () => {
++    const totp = enrol();
++    expect(totp.issuer).toBe('MainThrive Mail');
++    expect(totp.label).toBe('alice@example.com');
++  });
++
++  it('falls back to upstream\'s default app name, never "Stalwart", while the config is empty', () => {
++    config.appName = '';
++    expect(enrol().issuer).toBe('Webmail');
++  });
++
++  it('generateTotp puts the issuer it is given in the URL', () => {
++    const { url } = generateTotp('bob@example.com', 'Acme Mail');
++    expect(OTPAuth.URI.parse(url).issuer).toBe('Acme Mail');
++    expect(url).not.toContain('Stalwart');
++  });
++});
+diff --git a/components/settings/account-security-settings.tsx b/components/settings/account-security-settings.tsx
+index 35774b1..eafadab 100644
+--- a/components/settings/account-security-settings.tsx
++++ b/components/settings/account-security-settings.tsx
+@@ -12,6 +12,7 @@ import { SettingsSection, SettingItem, ToggleSwitch } from './settings-section';
+ import { useAccountSecurityStore, type AppPasswordInfo, type ApiKeyInfo, type AppCredentialInput } from '@/stores/account-security-store';
+ import { useAuthStore } from '@/stores/auth-store';
+ import { useAccountStore } from '@/stores/account-store';
++import { useConfig } from '@/hooks/use-config';
+ import { apiFetch, getPathPrefix } from '@/lib/browser-navigation';
+ import { toast } from '@/stores/toast-store';
+ import { cn } from '@/lib/utils';
+@@ -193,9 +194,11 @@ function DisplayNameSection() {
+   );
+ }
+ 
+-function generateTotp(accountLabel: string): { totp: OTPAuth.TOTP; url: string } {
++// The authenticator app names the entry after `issuer`, so it is this deployment's own name (APP_NAME),
++// never the mail server's: a hardcoded 'Stalwart' put that word in every user's authenticator.
++export function generateTotp(accountLabel: string, issuer: string): { totp: OTPAuth.TOTP; url: string } {
+   const totp = new OTPAuth.TOTP({
+-    issuer: 'Stalwart',
++    issuer,
+     label: accountLabel || 'account',
+     algorithm: 'SHA1',
+     digits: 6,
+@@ -209,6 +212,7 @@ function TotpSection() {
+   const t = useTranslations('settings.security');
+   const { otpEnabled, enableTotp, disableTotp, isSaving, isLoadingAuth } = useAccountSecurityStore();
+   const { client } = useAuthStore();
++  const { appName } = useConfig();
+ 
+   const [setupUrl, setSetupUrl] = useState<string | null>(null);
+   const [setupTotp, setSetupTotp] = useState<OTPAuth.TOTP | null>(null);
+@@ -228,7 +232,7 @@ function TotpSection() {
+   }, [setupUrl]);
+ 
+   const startSetup = () => {
+-    const { totp, url } = generateTotp(client?.getUsername() ?? 'account');
++    const { totp, url } = generateTotp(client?.getUsername() ?? 'account', appName || 'Webmail');
+     setSetupTotp(totp);
+     setSetupUrl(url);
+     setPassword('');

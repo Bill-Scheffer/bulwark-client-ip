@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with eleven patches:
+# Builds Bulwark from its own release source with twelve patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -41,6 +41,9 @@
 #     on the bearer token, measured). After a password change, which revokes the session's tokens, the
 #     session signs in again with the new password and the confirming code. Email Client Setup and Link
 #     Mobile App (for upstream's own app and JMAP clients, which this deployment does not offer) are no longer shown.
+#   0012-totp-issuer-is-app-name.patch: the otpauth URL a two-step enrolment shows names this webmail
+#     (APP_NAME) as its issuer, not 'Stalwart', so the user's authenticator app names the entry after the
+#     service they signed up for (MainThrive MAI-947).
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes.
 name: build
@@ -64,7 +67,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.12
+  VERSION: 1.11.2-clientip.13
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -106,7 +109,8 @@ jobs:
                    ../patch/patches/0008-files-no-stability-banner.patch \
                    ../patch/patches/0009-files-upload-errors-say-why.patch \
                    ../patch/patches/0010-restore-keeps-session-through-outage.patch \
-                   ../patch/patches/0011-token-session-keeps-account-security.patch; do
+                   ../patch/patches/0011-token-session-keeps-account-security.patch \
+                   ../patch/patches/0012-totp-issuer-is-app-name.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -121,7 +125,8 @@ jobs:
             ' M stores/auth-store.ts' '?? stores/__tests__/auth-store-restore-outage.test.ts' \
             ' M components/settings/account-security-settings.tsx' ' M stores/account-security-store.ts' \
             ' M stores/__tests__/account-security-store.test.ts' '?? stores/__tests__/auth-store-token-password.test.ts' \
-            '?? components/settings/__tests__/account-security-token-session.test.tsx' | LC_ALL=C sort | tr '\n' '|')
+            '?? components/settings/__tests__/account-security-token-session.test.tsx' \
+            '?? components/settings/__tests__/account-security-totp-issuer.test.tsx' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
           # 0008: the Files page renders no stability banner.
           ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
@@ -138,6 +143,10 @@ jobs:
           ! grep -nE "isOAuth|authMode === 'oauth'" components/settings/account-security-settings.tsx \
             && grep -qF 'keepTokenSessionThrough(' stores/account-security-store.ts \
             || { echo "::error::a token session's Security page still differs, or a password change does not renew it"; exit 1; }
+          # 0012: the TOTP issuer is the configured app name, never the mail server's.
+          ! grep -n "issuer: 'Stalwart'" components/settings/account-security-settings.tsx \
+            && grep -qF "generateTotp(client?.getUsername() ?? 'account', appName || 'Webmail')" components/settings/account-security-settings.tsx \
+            || { echo "::error::the TOTP enrolment still names Stalwart as its issuer"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
@@ -155,7 +164,8 @@ jobs:
             lib/__tests__/auth-routes-credential-check.test.ts lib/__tests__/settings-route-account-key.test.ts \
             lib/__tests__/wopi-token-not-a-session.test.ts stores/__tests__/auth-store-restore-outage.test.ts \
             stores/__tests__/auth-store-token-password.test.ts stores/__tests__/account-security-store.test.ts \
-            components/settings/__tests__/account-security-token-session.test.tsx
+            components/settings/__tests__/account-security-token-session.test.tsx \
+            components/settings/__tests__/account-security-totp-issuer.test.tsx
           npx tsc --noEmit -p tsconfig.json
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
