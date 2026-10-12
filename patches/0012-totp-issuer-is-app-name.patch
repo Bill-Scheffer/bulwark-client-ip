@@ -1,9 +1,9 @@
 diff --git a/components/settings/__tests__/account-security-totp-issuer.test.tsx b/components/settings/__tests__/account-security-totp-issuer.test.tsx
 new file mode 100644
-index 0000000..5b318c5
+index 00000000..efe1491e
 --- /dev/null
 +++ b/components/settings/__tests__/account-security-totp-issuer.test.tsx
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,53 @@
 +import { fireEvent, render } from '@testing-library/react';
 +import { describe, it, expect, vi, beforeEach } from 'vitest';
 +import * as OTPAuth from 'otpauth';
@@ -32,9 +32,8 @@ index 0000000..5b318c5
 +
 +/** Turn two-step on and decode the otpauth URL the setup shows, as an authenticator app would read it. */
 +function enrol(): OTPAuth.TOTP {
-+  const { container, getByText } = render(<AccountSecuritySettings />);
-+  const row = getByText('totp.label').closest('div')!.parentElement!;
-+  fireEvent.click(row.querySelector('button')!);
++  const { container, getByRole } = render(<AccountSecuritySettings />);
++  fireEvent.click(getByRole('switch', { name: 'totp.label' }));
 +  const shown = [...container.querySelectorAll('code')].map((c) => c.textContent ?? '').find((t) => t.startsWith('otpauth://'));
 +  if (!shown) throw new Error('no otpauth URL was shown');
 +  return OTPAuth.URI.parse(shown) as OTPAuth.TOTP;
@@ -59,7 +58,7 @@ index 0000000..5b318c5
 +  });
 +});
 diff --git a/components/settings/account-security-settings.tsx b/components/settings/account-security-settings.tsx
-index 35774b1..eafadab 100644
+index 35774b1d..eafadab8 100644
 --- a/components/settings/account-security-settings.tsx
 +++ b/components/settings/account-security-settings.tsx
 @@ -12,6 +12,7 @@ import { SettingsSection, SettingItem, ToggleSwitch } from './settings-section';
