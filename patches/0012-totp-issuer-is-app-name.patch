@@ -42,7 +42,7 @@ index 00000000..efe1491e
 +describe('the TOTP enrolment', () => {
 +  it('names the authenticator entry after the configured app name, not the mail server', () => {
 +    const totp = enrol();
-+    expect(totp.issuer).toBe('Stalwart Mail');
++    expect(totp.issuer).toBe('MainThrive Mail');
 +    expect(totp.label).toBe('alice@example.com');
 +  });
 +
