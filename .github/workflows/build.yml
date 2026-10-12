@@ -53,6 +53,7 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # Any new directory the build reads goes here too, or merging a change to it never rebuilds main.
     paths: [".github/workflows/build.yml", "patches/**", "scripts/**"]
   # No path filter: this job is the required check on main, and a check filtered out of a pull
   # request never reports, so that pull request could never merge.
@@ -63,10 +64,12 @@ permissions:
   contents: read
   packages: write
 
-# main builds one at a time and never cancels. Each pull request has its own group, and a new push
-# cancels its older run.
+# One group per ref: main builds one at a time and never cancels, and each pull request
+# (refs/pull/N/merge) has its own group, where a new push cancels its older run. Keyed on the ref
+# rather than the event, so a dispatch from a feature branch cannot displace main's pending build:
+# a group holds one pending run, and a newer one cancels it.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.number) || 'build' }}
+  group: build-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -197,7 +200,9 @@ jobs:
             org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP, ${{ env.PUSH_RELAY_URL }} as its push relay, push previews that renew an expired session, and a notification badge of its own
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Only main writes the cache: a pull request reads main's, and a build cache written per
+          # pull request would evict main's from the repository's 10 GB.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}
 
       - name: End-to-end against the built image
         run: bash patch/scripts/e2e.sh "${IMAGE}:${VERSION}" "${PUSH_RELAY_URL}"
