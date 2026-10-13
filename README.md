@@ -191,6 +191,24 @@ entry already enrolled keeps its old name until the user renames it or enrols ag
 decodes the URL it shows, as an authenticator app reads it. With the hardcoded issuer put back, all three cases
 fail.
 
+## A send on a phone returns to the list (`0013`, `clientip.14`)
+
+[`patches/0013-mobile-send-returns-to-list.patch`](patches/0013-mobile-send-returns-to-list.patch).
+On a phone the list, the reading pane and the composer are separate screens, and opening the composer switches to the
+reading pane's screen. After a send, upstream closed the composer and left that screen up. For a new message composed
+from the list there is nothing on it to read, so the user landed on its empty state, "No conversation selected",
+instead of the folder they came from (MainThrive MAI-1010, reported from the installed PWA). Upstream 1.11.2 does this
+with none of these patches applied. Upstream already returned to the list after sending a draft that was open on that
+screen; nothing else did.
+
+After a send, and after scheduling one, a phone with no message or conversation open goes back to the list. A reply
+sent from an open message still returns to that message.
+
+[`scripts/e2e-mobile-send.sh`](scripts/e2e-mobile-send.sh) runs the built image in demo mode (`DEMO_MODE=true`,
+fixture data, no mail server) and drives it in a 390 × 844 touch browser: sign in to the demo, compose and send from
+the inbox, and the list must be on screen; open a message, reply and send, and the message must still be on screen.
+Against upstream 1.11.2 the first half fails. The scheduled-send path shares the fix but is not exercised by the e2e.
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
