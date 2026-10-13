@@ -9,10 +9,11 @@ set -euo pipefail
 IMAGE="$1"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLAYWRIGHT=mcr.microsoft.com/playwright:v1.63.0-noble
-SHOTS="$(mktemp -d)"
-cleanup() { docker rm -f e2e-ms-bw >/dev/null 2>&1 || true; }
+SHOTS=""
+cleanup() { docker rm -f e2e-ms-bw >/dev/null 2>&1 || true; [ -z "$SHOTS" ] || rm -rf "$SHOTS" 2>/dev/null || true; }
 trap cleanup EXIT
 cleanup
+SHOTS="$(mktemp -d)"
 chmod 777 "$SHOTS"
 
 docker run -d --name e2e-ms-bw -e DEMO_MODE=true -e JMAP_SERVER_URL=https://mail.example.test \

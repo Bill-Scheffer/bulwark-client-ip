@@ -34,8 +34,7 @@ await page.getByPlaceholder('Subject').fill('e2e mobile send');
 await page.locator('[contenteditable=true]:visible').first().fill('hello');
 await page.getByRole('button', { name: 'Send', exact: true }).click();
 await page.getByText('Email sent successfully').waitFor({ timeout: 30_000 });
-try { await compose.waitFor({ timeout: 5_000 }); } catch {}
-if (!(await onList())) await fail(page, 'after-send', 'after a send the list is not on screen (the empty reading pane is)');
+if (!(await compose.waitFor({ timeout: 10_000 }).then(onList, () => false))) await fail(page, 'after-send', 'after a send the list is not on screen (the empty reading pane is)');
 console.log('on the list');
 
 console.log('== a reply, sent from an open message, lands on that message');
