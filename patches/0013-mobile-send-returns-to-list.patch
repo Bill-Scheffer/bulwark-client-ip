@@ -10,7 +10,7 @@ index 286b3a8..80a9258 100644
 +  // nothing behind it to read - a new message composed from the list - left the reading pane up
 +  // showing its empty state ("No conversation selected") instead of the folder the user came from.
 +  const returnToListIfNothingToRead = () => {
-+    if (isMobile && !selectedEmail && !conversationThread) setActiveView('list');
++    if (isMobile && !selectedEmail && !conversationThread) setActiveView(activeView);
 +  };
 +
    const handleEmailSend = async (data: {
