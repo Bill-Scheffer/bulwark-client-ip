@@ -9,12 +9,9 @@ set -euo pipefail
 IMAGE="$1"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PLAYWRIGHT=mcr.microsoft.com/playwright:v1.63.0-noble
-SHOTS=""
-cleanup() { docker rm -f e2e-ms-bw >/dev/null 2>&1 || true; [ -z "$SHOTS" ] || rm -rf "$SHOTS" 2>/dev/null || true; }
+cleanup() { docker rm -f e2e-ms-bw >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 cleanup
-SHOTS="$(mktemp -d)"
-chmod 777 "$SHOTS"
 
 docker run -d --name e2e-ms-bw -e DEMO_MODE=true -e JMAP_SERVER_URL=https://mail.example.test \
   -e SESSION_SECRET="$(openssl rand -hex 32)" "$IMAGE" >/dev/null
@@ -25,6 +22,6 @@ for _ in $(seq 1 60); do
 done
 [ -n "$healthy" ] || { docker logs e2e-ms-bw | tail -20; echo "::error::the image did not become healthy"; exit 1; }
 
-docker run --rm --network container:e2e-ms-bw -v "$HERE/e2e-mobile-send.mjs:/e2e/e2e.mjs:ro" -v "$SHOTS:/shots" \
-  "$PLAYWRIGHT" bash -c 'cd /e2e && npm i --silent --no-audit --no-fund playwright-core@1.63.0 >/dev/null && node e2e.mjs http://localhost:3000 /shots' \
-  || { ls "$SHOTS"; docker logs e2e-ms-bw 2>&1 | tail -30; exit 1; }
+docker run --rm --network container:e2e-ms-bw -v "$HERE/e2e-mobile-send.mjs:/e2e/e2e.mjs:ro" \
+  "$PLAYWRIGHT" bash -c 'cd /e2e && npm i --silent --no-audit --no-fund playwright-core@1.63.0 >/dev/null && node e2e.mjs http://localhost:3000' \
+  || { docker logs e2e-ms-bw 2>&1 | tail -30; exit 1; }
