@@ -1,0 +1,34 @@
+diff --git a/components/mail/mail-app.tsx b/components/mail/mail-app.tsx
+index 286b3a8..80a9258 100644
+--- a/components/mail/mail-app.tsx
++++ b/components/mail/mail-app.tsx
+@@ -1677,6 +1677,13 @@ export function MailApp({ linkSegments: routeSegments }: MailAppProps = {}) {
+     appRootRef.current?.querySelector<HTMLElement>('[data-sidebar-toggle]')?.focus();
+   }, [isMobile, isTablet, sidebarOpen]);
+ 
++  // On a phone the composer is a screen of its own over the list. Closing it after a send with
++  // nothing behind it to read - a new message composed from the list - left the reading pane up
++  // showing its empty state ("No conversation selected") instead of the folder the user came from.
++  const returnToListIfNothingToRead = () => {
++    if (isMobile && !selectedEmail && !conversationThread) setActiveView('list');
++  };
++
+   const handleEmailSend = async (data: {
+     to: string[];
+     cc: string[];
+@@ -1733,6 +1740,7 @@ export function MailApp({ linkSegments: routeSegments }: MailAppProps = {}) {
+         selectEmail(null);
+         if (isMobile) setActiveView('list');
+       }
++      returnToListIfNothingToRead();
+       if (result.filingError) {
+         // The mail went out, but a post-send step (filing to Sent /
+         // removing the old draft) was rejected - warn instead of staying
+@@ -4328,6 +4336,7 @@ export function MailApp({ linkSegments: routeSegments }: MailAppProps = {}) {
+                     }
+                     setShowComposer(false);
+                     setPendingDraft(null);
++                    returnToListIfNothingToRead();
+                   }}
+                   onClose={() => {
+                     setShowComposer(false);

@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with twelve patches:
+# Builds Bulwark from its own release source with thirteen patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -44,6 +44,9 @@
 #   0012-totp-issuer-is-app-name.patch: the otpauth URL a two-step enrolment shows names this webmail
 #     (APP_NAME) as its issuer, not 'Stalwart', so the user's authenticator app names the entry after the
 #     service they signed up for (MainThrive MAI-947).
+#   0013-mobile-send-returns-to-list.patch: on a phone, sending a new message from the list returns to
+#     the list. Upstream closed the composer and left the reading pane up with nothing in it, so the user
+#     landed on "No conversation selected" (MainThrive MAI-1010). A reply still returns to its message.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes. The release tag is pushed only from main; a dispatch
 # from another branch pushes branch-<short sha> instead, and a pull request runs every step but the
@@ -79,7 +82,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.13
+  VERSION: 1.11.2-clientip.14
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -162,7 +165,8 @@ jobs:
                    ../patch/patches/0009-files-upload-errors-say-why.patch \
                    ../patch/patches/0010-restore-keeps-session-through-outage.patch \
                    ../patch/patches/0011-token-session-keeps-account-security.patch \
-                   ../patch/patches/0012-totp-issuer-is-app-name.patch; do
+                   ../patch/patches/0012-totp-issuer-is-app-name.patch \
+                   ../patch/patches/0013-mobile-send-returns-to-list.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -178,7 +182,8 @@ jobs:
             ' M components/settings/account-security-settings.tsx' ' M stores/account-security-store.ts' \
             ' M stores/__tests__/account-security-store.test.ts' '?? stores/__tests__/auth-store-token-password.test.ts' \
             '?? components/settings/__tests__/account-security-token-session.test.tsx' \
-            '?? components/settings/__tests__/account-security-totp-issuer.test.tsx' | LC_ALL=C sort | tr '\n' '|')
+            '?? components/settings/__tests__/account-security-totp-issuer.test.tsx' \
+            ' M components/mail/mail-app.tsx' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
           # 0008: the Files page renders no stability banner.
           ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
@@ -199,6 +204,9 @@ jobs:
           ! grep -n "issuer: 'Stalwart'" components/settings/account-security-settings.tsx \
             && grep -qF "generateTotp(client?.getUsername() ?? 'account', appName || 'Webmail')" components/settings/account-security-settings.tsx \
             || { echo "::error::the TOTP enrolment still names Stalwart as its issuer"; exit 1; }
+          # 0013: both send paths return a phone to the list when nothing is left to read.
+          [ "$(grep -cF 'returnToListIfNothingToRead();' components/mail/mail-app.tsx)" = 2 ] \
+            || { echo "::error::a send on a phone still leaves the empty reading pane up"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
@@ -254,6 +262,9 @@ jobs:
 
       - name: End-to-end, the notification badge has its own image
         run: bash patch/scripts/e2e-badge.sh "${IMAGE}:${VERSION}"
+
+      - name: End-to-end, a phone-sized browser - a send from the list returns to the list
+        run: bash patch/scripts/e2e-mobile-send.sh "${IMAGE}:${VERSION}"
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
