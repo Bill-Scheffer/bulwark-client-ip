@@ -214,7 +214,7 @@ jobs:
           [ "$(grep -cF 'returnToListIfNothingToRead();' components/mail/mail-app.tsx)" = 2 ] \
             || { echo "::error::a send on a phone still leaves the empty reading pane up"; exit 1; }
           # 0014: the re-sign-in after a password change asks for the next code, never reuses the confirming one.
-          grep -qF 'const totp = nextCode ? await nextCode(refused) : undefined;' stores/auth-store.ts \
+          grep -qF 'const totp = nextCode ? await nextCode(tries > 0) : undefined;' stores/auth-store.ts \
             && ! grep -nF 'totp: otpCode,' stores/auth-store.ts \
             || { echo "::error::a password change still signs in again with the code it was confirmed with"; exit 1; }
 
