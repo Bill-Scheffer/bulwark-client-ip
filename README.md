@@ -216,15 +216,18 @@ Against upstream 1.11.2 the first half fails. The scheduled-send path shares the
 code the change was confirmed with. MainThrive's Stalwart now accepts a code once (stalwart-r2-patch `0012`, MainThrive
 MAI-997, RFC 6238 § 5.2), so that sign-in is refused and the session would end. So once the change is applied, the form
 asks for the next code ("Password changed. Stay signed in?"): the user waits for the authenticator to show a new code,
-up to 30 seconds, and types it. A refused code (the same one again, or a typo) is asked for again, saying why;
-"Sign out", or leaving the page while it asks, ends the session as an expired one, as before `0011`. Token refreshes
+up to 30 seconds, and types it (the button waits for six digits). A refused code (the same one again, or a typo) is
+asked for again, saying why, up to three codes, after which the session ends as an expired one, as before `0011`.
+"Sign out", or leaving the page while it asks, signs out (not reported as expired). If the user signs out or switches
+account while it asks, nothing more happens to that session. Token refreshes
 stay held while it asks, so a request in the meantime waits rather than spending the revoked token. A session without
 two-step signs in again with the new password alone, as before.
 
 `stores/__tests__/auth-store-token-password.test.ts` (the next code asked for after the change, a refused code asked
-for again with a request waiting through it, declining, another failure, no two-step),
-`components/settings/__tests__/account-security-next-code.test.tsx` (the prompt shows after the change, passes on the
-code, says when one was refused, and passes on nothing when declined or left) and one changed assertion in
+for again with a request waiting through it, at most three codes, declining, an account switch while it asks,
+another failure, no two-step),
+`components/settings/__tests__/account-security-next-code.test.tsx` (the prompt shows after the change, passes on a
+six-digit code only, says when one was refused, and passes on nothing when declined, left, or the account changes) and one changed assertion in
 `stores/__tests__/account-security-store.test.ts`. With `0014` reverted, the cases that ask for a code fail.
 
 ## Verified
