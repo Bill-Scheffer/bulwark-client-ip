@@ -165,8 +165,8 @@ refused change, a password session), `components/settings/__tests__/account-secu
 `stores/__tests__/account-security-store.test.ts`. On unpatched 1.11.2 the token-session cases fail.
 
 **Known limits, accepted at review.**
-- **Code reuse.** The re-sign-in reuses the confirming code. If the server ever refuses a code a second time,
-  a password change ends the session as expired.
+- **Code reuse.** ~~The re-sign-in reuses the confirming code.~~ Superseded by `0014`, below: MainThrive's
+  Stalwart now refuses a code a second time, so the re-sign-in asks for the next one.
 - **The push preview.** Its server-side token renewal (`/api/push/preview`) cannot see the client's hold. A
   preview that renewed the session in the same second as the change can put the revoked tokens back in the
   slot, and the next refresh then ends the session as expired.
@@ -208,6 +208,24 @@ sent from an open message still returns to that message.
 fixture data, no mail server) and drives it in a 390 × 844 touch browser: sign in to the demo, compose and send from
 the inbox, and the list must be on screen; open a message, reply and send, and the message must still be on screen.
 Against upstream 1.11.2 the first half fails. The scheduled-send path shares the fix but is not exercised by the e2e.
+
+## A password change asks for the next code (`0014`, `clientip.15`)
+
+[`patches/0014-password-change-asks-for-the-next-code.patch`](patches/0014-password-change-asks-for-the-next-code.patch).
+`0011` kept a two-step session signed in through a password change by signing in again with the new password and the
+code the change was confirmed with. MainThrive's Stalwart now accepts a code once (stalwart-r2-patch `0012`, MainThrive
+MAI-997, RFC 6238 § 5.2), so that sign-in is refused and the session would end. So once the change is applied, the form
+asks for the next code ("Password changed. Stay signed in?"): the user waits for the authenticator to show a new code,
+up to 30 seconds, and types it. A refused code (the same one again, or a typo) is asked for again, saying why;
+"Sign out", or leaving the page while it asks, ends the session as an expired one, as before `0011`. Token refreshes
+stay held while it asks, so a request in the meantime waits rather than spending the revoked token. A session without
+two-step signs in again with the new password alone, as before.
+
+`stores/__tests__/auth-store-token-password.test.ts` (the next code asked for after the change, a refused code asked
+for again with a request waiting through it, declining, another failure, no two-step),
+`components/settings/__tests__/account-security-next-code.test.tsx` (the prompt shows after the change, passes on the
+code, says when one was refused, and passes on nothing when declined or left) and one changed assertion in
+`stores/__tests__/account-security-store.test.ts`. With `0014` reverted, the cases that ask for a code fail.
 
 ## Verified
 
