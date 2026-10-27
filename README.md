@@ -237,7 +237,8 @@ when the browser fires `beforeinstallprompt`, and Safari on an iPhone or iPad ne
 page can call, so the card never appeared where most of MainThrive's users would install the app. iOS 26 does make every
 site added to the Home Screen open as a web app, so the steps are all that is missing. In iOS Safari, and only while the
 page is not already open from the Home Screen (`display-mode: standalone`, or `navigator.standalone`), the card now
-shows them instead of an Install button:
+shows them instead of an Install button, once the user has signed in (on the sign-in page it sat over the sign-in
+button, which the e2e caught):
 
 1. ⋯ beside the address bar, then Share (an iPad's Share is at the top);
 2. Add to Home Screen;
@@ -247,7 +248,7 @@ An arrow bounces toward Safari's toolbar: below the card on an iPhone, above it 
 and Don't remind me again work as before. An iPad that asks for the desktop site is told apart from a Mac by its touch
 screen. Chrome, Firefox, Edge and Opera on iOS name themselves in the user agent, and get nothing, since their steps differ.
 `components/__tests__/pwa-install-prompt-ios.test.tsx` covers which devices count, the iPhone and iPad layouts, and the
-three cases that show nothing; with the Home Screen check removed, the Home Screen case fails. [`scripts/e2e-ios-install.sh`](scripts/e2e-ios-install.sh) checks the built
+cases that show nothing, including before sign-in; with the Home Screen check or the sign-in check removed, its case fails. [`scripts/e2e-ios-install.sh`](scripts/e2e-ios-install.sh) checks the built
 image in demo mode: WebKit as an iPhone gets the three steps and no Install button, and Chrome as an Android phone does
 not get them. `OUT=<dir>` saves the iPhone's screenshot for review (MainThrive MAI-1181).
 

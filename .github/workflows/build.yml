@@ -53,7 +53,8 @@
 #     code is asked for again; declining, or leaving the page, ends the session as expired, as before 0011.
 #   0015-ios-safari-install-steps.patch: on an iPhone or iPad in Safari, which never fires beforeinstallprompt, the
 #     Install card shows the Add to Home Screen steps, with an arrow toward Safari's toolbar, instead of never
-#     appearing. Not once the app is opened from the Home Screen, nor in another iOS browser (MainThrive MAI-1181).
+#     appearing. Once signed in, never once the app is opened from the Home Screen, nor in another iOS browser
+#     (MainThrive MAI-1181).
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes. The release tag is pushed only from main; a dispatch
 # from another branch pushes branch-<short sha> instead, and a pull request runs every step but the
@@ -222,8 +223,8 @@ jobs:
           grep -qF 'const totp = nextCode ? await nextCode(tries > 0) : undefined;' stores/auth-store.ts \
             && ! grep -nF 'totp: otpCode,' stores/auth-store.ts \
             || { echo "::error::a password change still signs in again with the code it was confirmed with"; exit 1; }
-          # 0015: iOS Safari gets the install steps, and only while the app is not opened from the Home Screen.
-          grep -qF 'if (isIosSafari() && !isStandalone()) {' components/pwa-install-prompt.tsx \
+          # 0015: iOS Safari gets the install steps once signed in, and only while the app is not opened from the Home Screen.
+          grep -qF 'if (isAuthenticated && !isStandalone()) {' components/pwa-install-prompt.tsx \
             || { echo "::error::iOS Safari still gets no install card"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
