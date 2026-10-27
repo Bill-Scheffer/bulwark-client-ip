@@ -238,7 +238,7 @@ page can call, so the card never appeared where most of MainThrive's users would
 site added to the Home Screen open as a web app, so the steps are all that is missing. In iOS Safari, and only while the
 page is not already open from the Home Screen (`display-mode: standalone`, or `navigator.standalone`), the card now
 shows them instead of an Install button, once the user has signed in (on the sign-in page it sat over the sign-in
-button, which the e2e caught):
+button, which the e2e caught, so it also goes on sign-out):
 
 1. ⋯ beside the address bar, then Share (an iPad's Share is at the top);
 2. Add to Home Screen;

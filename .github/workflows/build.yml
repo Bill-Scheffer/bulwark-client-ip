@@ -224,7 +224,7 @@ jobs:
             && ! grep -nF 'totp: otpCode,' stores/auth-store.ts \
             || { echo "::error::a password change still signs in again with the code it was confirmed with"; exit 1; }
           # 0015: iOS Safari gets the install steps once signed in, and only while the app is not opened from the Home Screen.
-          grep -qF 'if (isAuthenticated && !isStandalone()) {' components/pwa-install-prompt.tsx \
+          grep -qF 'const show = isAuthenticated && !isStandalone();' components/pwa-install-prompt.tsx \
             || { echo "::error::iOS Safari still gets no install card"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0

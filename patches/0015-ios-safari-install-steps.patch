@@ -1,9 +1,9 @@
 diff --git a/components/__tests__/pwa-install-prompt-ios.test.tsx b/components/__tests__/pwa-install-prompt-ios.test.tsx
 new file mode 100644
-index 0000000..b54c11a
+index 0000000..08e4652
 --- /dev/null
 +++ b/components/__tests__/pwa-install-prompt-ios.test.tsx
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,111 @@
 +import { act, fireEvent, render, screen } from "@testing-library/react";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +import { isIosSafari, PWAInstallPrompt } from "../pwa-install-prompt";
@@ -94,13 +94,15 @@ index 0000000..b54c11a
 +    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 +  });
 +
-+  it("waits for sign-in, where it would sit over the sign-in page's controls", () => {
++  it("waits for sign-in, and goes on sign-out, where it would sit over the sign-in page's controls", () => {
 +    useAuthStore.setState({ isAuthenticated: false });
 +    asDevice(IPHONE_SAFARI, 5);
 +    render(<PWAInstallPrompt />);
 +    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 +    act(() => useAuthStore.setState({ isAuthenticated: true }));
 +    expect(screen.getByRole("dialog")).toBeInTheDocument();
++    act(() => useAuthStore.setState({ isAuthenticated: false }));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 +  });
 +
 +  it("Not now hides it for this visit only", () => {
@@ -114,7 +116,7 @@ index 0000000..b54c11a
 +  });
 +});
 diff --git a/components/pwa-install-prompt.tsx b/components/pwa-install-prompt.tsx
-index 20195bd..7389561 100644
+index 20195bd..07d097f 100644
 --- a/components/pwa-install-prompt.tsx
 +++ b/components/pwa-install-prompt.tsx
 @@ -2,9 +2,10 @@
@@ -172,10 +174,10 @@ index 20195bd..7389561 100644
      if (localStorage.getItem(DISMISSED_KEY)) return;
  
 +    if (isIosSafari()) {
-+      if (isAuthenticated && !isStandalone()) {
-+        setIosSteps(isIpad() ? "ipad" : "iphone");
-+        setShowPrompt(true);
-+      }
++      // Signed out (or never signed in) hides it again: the sign-in page is where it would be in the way.
++      const show = isAuthenticated && !isStandalone();
++      setIosSteps(show ? (isIpad() ? "ipad" : "iphone") : null);
++      setShowPrompt(show);
 +      return;
 +    }
 +
