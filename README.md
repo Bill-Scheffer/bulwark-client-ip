@@ -244,7 +244,8 @@ button, which the e2e caught):
 2. Add to Home Screen;
 3. leave Open as Web App on, and Add.
 
-An arrow bounces toward Safari's toolbar: below the card on an iPhone, above it at the top right on an iPad. Not now
+The first step's icon is an arrow bouncing toward Safari's toolbar: down on an iPhone, where the card sits just above
+webmail's own tab bar so it never covers it, and up on an iPad, where the card is at the top right. Not now
 and Don't remind me again work as before. An iPad that asks for the desktop site is told apart from a Mac by its touch
 screen. Chrome, Firefox, Edge and Opera on iOS name themselves in the user agent, and get nothing, since their steps differ.
 `components/__tests__/pwa-install-prompt-ios.test.tsx` covers which devices count, the iPhone and iPad layouts, and the

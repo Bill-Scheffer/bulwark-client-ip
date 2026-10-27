@@ -1,9 +1,9 @@
 diff --git a/components/__tests__/pwa-install-prompt-ios.test.tsx b/components/__tests__/pwa-install-prompt-ios.test.tsx
 new file mode 100644
-index 0000000..6a8172d
+index 0000000..b54c11a
 --- /dev/null
 +++ b/components/__tests__/pwa-install-prompt-ios.test.tsx
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,109 @@
 +import { act, fireEvent, render, screen } from "@testing-library/react";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +import { isIosSafari, PWAInstallPrompt } from "../pwa-install-prompt";
@@ -52,23 +52,24 @@ index 0000000..6a8172d
 +    expect(isIosSafari(nav(ANDROID_CHROME))).toBe(false);
 +  });
 +
-+  it("shows an iPhone the steps, with the arrow below the card toward Safari's toolbar, and no Install button", () => {
++  it("shows an iPhone the steps above webmail's tab bar, the first one's arrow toward Safari's toolbar, and no Install button", () => {
 +    asDevice(IPHONE_SAFARI, 5);
 +    render(<PWAInstallPrompt />);
 +    const dialog = screen.getByRole("dialog");
-+    expect(dialog.className).toContain("bottom-4");
++    expect(dialog.className).toContain("bottom-[calc(4rem+env(safe-area-inset-bottom)/2)]");
 +    expect([...dialog.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["ios_step_share", "ios_step_add", "ios_step_confirm"]);
-+    expect(dialog.lastElementChild!.className).toContain("animate-bounce");
++    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("animate-bounce");
++    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("arrow-down");
 +    expect(screen.queryByText("install")).not.toBeInTheDocument();
 +  });
 +
-+  it("shows an iPad its own first step, with the arrow above the card, toward Share at the top right", () => {
++  it("shows an iPad its own first step at the top right, its arrow pointing up toward Share", () => {
 +    asDevice(IPAD_DESKTOP_SAFARI, 5);
 +    render(<PWAInstallPrompt />);
 +    const dialog = screen.getByRole("dialog");
 +    expect(dialog.className).toContain("top-4");
 +    expect(dialog.querySelector("li")!.textContent).toBe("ios_step_share_ipad");
-+    expect(dialog.firstElementChild!.className).toContain("animate-bounce");
++    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("arrow-up");
 +  });
 +
 +  it("shows nothing once opened from the Home Screen, in another browser, or after Don't remind me again", () => {
@@ -113,7 +114,7 @@ index 0000000..6a8172d
 +  });
 +});
 diff --git a/components/pwa-install-prompt.tsx b/components/pwa-install-prompt.tsx
-index 20195bd..420855f 100644
+index 20195bd..7389561 100644
 --- a/components/pwa-install-prompt.tsx
 +++ b/components/pwa-install-prompt.tsx
 @@ -2,9 +2,10 @@
@@ -121,7 +122,7 @@ index 20195bd..420855f 100644
  import { useEffect, useState } from "react";
  import { useTranslations } from "next-intl";
 -import { X, Download } from "@/components/icons";
-+import { X, Download, ArrowDown, ArrowUp, Ellipsis, Share2 } from "@/components/icons";
++import { X, Download, ArrowDown, ArrowUp, Share2 } from "@/components/icons";
  import { useConfig } from "@/hooks/use-config";
  import { withBasePath } from "@/lib/browser-navigation";
 +import { useAuthStore } from "@/stores/auth-store";
@@ -190,7 +191,7 @@ index 20195bd..420855f 100644
  
    useEffect(() => {
      promptVisible = showPrompt;
-@@ -80,13 +117,74 @@ export function PWAInstallPrompt() {
+@@ -80,13 +117,70 @@ export function PWAInstallPrompt() {
      setShowPrompt(false);
    };
  
@@ -203,16 +204,15 @@ index 20195bd..420855f 100644
    const darkLogoSrc = withBasePath(appLogoDarkUrl || faviconUrl);
  
 +  if (iosSteps) {
-+    const arrow = iosSteps === "ipad" ? <ArrowUp className="w-6 h-6" /> : <ArrowDown className="w-6 h-6" />;
++    // The first step's icon is the arrow, bouncing toward Safari's toolbar. On a phone the card sits above webmail's
++    // own tab bar (3.25rem and half the safe area), so it never covers it, and the arrow never lands on a tab.
++    const Arrow = iosSteps === "ipad" ? ArrowUp : ArrowDown;
 +    return (
 +      <div
 +        role="dialog"
 +        aria-label={t("title", { appName })}
-+        className={`fixed z-50 inset-x-4 mx-auto max-w-sm ${iosSteps === "ipad" ? "top-4 sm:inset-x-auto sm:right-4" : "bottom-4"}`}
++        className={`fixed z-50 inset-x-4 mx-auto max-w-sm ${iosSteps === "ipad" ? "top-4 sm:inset-x-auto sm:right-4" : "bottom-[calc(4rem+env(safe-area-inset-bottom)/2)]"}`}
 +      >
-+        {iosSteps === "ipad" && (
-+          <div className="flex justify-end pr-6 pb-1 text-blue-600 dark:text-blue-400 animate-bounce" aria-hidden="true">{arrow}</div>
-+        )}
 +        <div className="bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-neutral-200 dark:border-neutral-800 p-4">
 +          <div className="flex items-start justify-between mb-3">
 +            <div>
@@ -229,7 +229,7 @@ index 20195bd..420855f 100644
 +          </div>
 +          <ol className="space-y-2 mb-3 text-sm text-neutral-800 dark:text-neutral-200">
 +            <li className="flex items-start gap-2">
-+              <Ellipsis className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400" aria-hidden="true" />
++              <Arrow className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400 animate-bounce" aria-hidden="true" />
 +              <span>{t(iosSteps === "ipad" ? "ios_step_share_ipad" : "ios_step_share")}</span>
 +            </li>
 +            <li className="flex items-start gap-2">
@@ -256,9 +256,6 @@ index 20195bd..420855f 100644
 +            </button>
 +          </div>
 +        </div>
-+        {iosSteps === "iphone" && (
-+          <div className="flex justify-center pt-1 text-blue-600 dark:text-blue-400 animate-bounce" aria-hidden="true">{arrow}</div>
-+        )}
 +      </div>
 +    );
 +  }
