@@ -230,6 +230,29 @@ another failure, no two-step),
 six-digit code only, says when one was refused, and passes on nothing when declined, left, or the account changes) and one changed assertion in
 `stores/__tests__/account-security-store.test.ts`. With `0014` reverted, the cases that ask for a code fail.
 
+## The Install card on an iPhone (`0015`, `clientip.16`)
+
+[`patches/0015-ios-safari-install-steps.patch`](patches/0015-ios-safari-install-steps.patch). The Install card appears
+when the browser fires `beforeinstallprompt`, and Safari on an iPhone or iPad never does: iOS has no install prompt a
+page can call, so the card never appeared where most of MainThrive's users would install the app. iOS 26 does make every
+site added to the Home Screen open as a web app, so the steps are all that is missing. In iOS Safari, and only while the
+page is not already open from the Home Screen (`display-mode: standalone`, or `navigator.standalone`), the card now
+shows them instead of an Install button, once the user has signed in (on the sign-in page it sat over the sign-in
+button, which the e2e caught, so it also goes on sign-out):
+
+1. ⋯ beside the address bar, then Share (an iPad's Share is at the top);
+2. Add to Home Screen;
+3. leave Open as Web App on, and Add.
+
+The first step's icon is an arrow bouncing toward Safari's toolbar: down on an iPhone, where the card sits just above
+webmail's own tab bar so it never covers it, and up on an iPad, where the card is at the top right. Not now
+and Don't remind me again work as before. An iPad that asks for the desktop site is told apart from a Mac by its touch
+screen. Chrome, Firefox, Edge and Opera on iOS name themselves in the user agent, and get nothing, since their steps differ.
+`components/__tests__/pwa-install-prompt-ios.test.tsx` covers which devices count, the iPhone and iPad layouts, and the
+cases that show nothing, including before sign-in; with the Home Screen check or the sign-in check removed, its case fails. [`scripts/e2e-ios-install.sh`](scripts/e2e-ios-install.sh) checks the built
+image in demo mode: WebKit as an iPhone gets the three steps and no Install button, and Chrome as an Android phone does
+not get them. `OUT=<dir>` saves the iPhone's screenshot for review (MainThrive MAI-1181).
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

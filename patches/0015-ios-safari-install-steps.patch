@@ -1,0 +1,285 @@
+diff --git a/components/__tests__/pwa-install-prompt-ios.test.tsx b/components/__tests__/pwa-install-prompt-ios.test.tsx
+new file mode 100644
+index 0000000..08e4652
+--- /dev/null
++++ b/components/__tests__/pwa-install-prompt-ios.test.tsx
+@@ -0,0 +1,111 @@
++import { act, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { isIosSafari, PWAInstallPrompt } from "../pwa-install-prompt";
++import { useAuthStore } from "@/stores/auth-store";
++
++vi.mock("@/hooks/use-config", () => ({
++  useConfig: () => ({ appName: "Bulwark", faviconUrl: "", appLogoLightUrl: "", appLogoDarkUrl: "" }),
++}));
++
++const IPHONE_SAFARI =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
++const IPAD_DESKTOP_SAFARI =
++  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
++const IPHONE_CHROME =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/141.0.7390.96 Mobile/15E148 Safari/604.1";
++const ANDROID_CHROME =
++  "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36";
++
++const nav = (userAgent: string, maxTouchPoints = 5) => ({ userAgent, maxTouchPoints }) as Navigator;
++
++function asDevice(userAgent: string, maxTouchPoints: number, standalone = false) {
++  vi.spyOn(navigator, "userAgent", "get").mockReturnValue(userAgent);
++  // jsdom has neither: an own property each, removed after every test.
++  Object.defineProperty(navigator, "maxTouchPoints", { value: maxTouchPoints, configurable: true });
++  Object.defineProperty(navigator, "standalone", { value: standalone, configurable: true });
++}
++
++// MainThrive MAI-1181. iOS Safari never fires beforeinstallprompt, so the card upstream shows on Android and desktop
++// Chrome never appeared on an iPhone. It shows the Add to Home Screen steps there instead.
++describe("PWAInstallPrompt on iOS Safari", () => {
++  beforeEach(() => {
++    localStorage.clear();
++    useAuthStore.setState({ isAuthenticated: true });
++  });
++  afterEach(() => {
++    vi.restoreAllMocks();
++    delete (navigator as Navigator & { standalone?: boolean }).standalone;
++    delete (navigator as { maxTouchPoints?: number }).maxTouchPoints;
++  });
++
++  it("knows iOS Safari, including an iPad asking for the desktop site, and nothing else", () => {
++    expect(isIosSafari(nav(IPHONE_SAFARI))).toBe(true);
++    expect(isIosSafari(nav(IPAD_DESKTOP_SAFARI, 5))).toBe(true);
++    expect(isIosSafari(nav(IPAD_DESKTOP_SAFARI, 0))).toBe(false); // a Mac
++    expect(isIosSafari(nav(IPHONE_CHROME))).toBe(false);
++    expect(isIosSafari(nav(ANDROID_CHROME))).toBe(false);
++  });
++
++  it("shows an iPhone the steps above webmail's tab bar, the first one's arrow toward Safari's toolbar, and no Install button", () => {
++    asDevice(IPHONE_SAFARI, 5);
++    render(<PWAInstallPrompt />);
++    const dialog = screen.getByRole("dialog");
++    expect(dialog.className).toContain("bottom-[calc(4rem+env(safe-area-inset-bottom)/2)]");
++    expect([...dialog.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["ios_step_share", "ios_step_add", "ios_step_confirm"]);
++    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("animate-bounce");
++    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("arrow-down");
++    expect(screen.queryByText("install")).not.toBeInTheDocument();
++  });
++
++  it("shows an iPad its own first step at the top right, its arrow pointing up toward Share", () => {
++    asDevice(IPAD_DESKTOP_SAFARI, 5);
++    render(<PWAInstallPrompt />);
++    const dialog = screen.getByRole("dialog");
++    expect(dialog.className).toContain("top-4");
++    expect(dialog.querySelector("li")!.textContent).toBe("ios_step_share_ipad");
++    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("arrow-up");
++  });
++
++  it("shows nothing once opened from the Home Screen, in another browser, or after Don't remind me again", () => {
++    asDevice(IPHONE_SAFARI, 5, true);
++    const { unmount } = render(<PWAInstallPrompt />);
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    unmount();
++
++    vi.restoreAllMocks();
++    asDevice(IPHONE_CHROME, 5);
++    const second = render(<PWAInstallPrompt />);
++    expect(screen.queryByText("ios_description")).not.toBeInTheDocument();
++    second.unmount();
++
++    vi.restoreAllMocks();
++    asDevice(IPHONE_SAFARI, 5);
++    const third = render(<PWAInstallPrompt />);
++    fireEvent.click(screen.getByText("dont_remind"));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    third.unmount();
++    render(<PWAInstallPrompt />);
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++  });
++
++  it("waits for sign-in, and goes on sign-out, where it would sit over the sign-in page's controls", () => {
++    useAuthStore.setState({ isAuthenticated: false });
++    asDevice(IPHONE_SAFARI, 5);
++    render(<PWAInstallPrompt />);
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    act(() => useAuthStore.setState({ isAuthenticated: true }));
++    expect(screen.getByRole("dialog")).toBeInTheDocument();
++    act(() => useAuthStore.setState({ isAuthenticated: false }));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++  });
++
++  it("Not now hides it for this visit only", () => {
++    asDevice(IPHONE_SAFARI, 5);
++    const { unmount } = render(<PWAInstallPrompt />);
++    fireEvent.click(screen.getByText("not_now"));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    unmount();
++    render(<PWAInstallPrompt />);
++    expect(screen.getByRole("dialog")).toBeInTheDocument();
++  });
++});
+diff --git a/components/pwa-install-prompt.tsx b/components/pwa-install-prompt.tsx
+index 20195bd..07d097f 100644
+--- a/components/pwa-install-prompt.tsx
++++ b/components/pwa-install-prompt.tsx
+@@ -2,9 +2,10 @@
+ 
+ import { useEffect, useState } from "react";
+ import { useTranslations } from "next-intl";
+-import { X, Download } from "@/components/icons";
++import { X, Download, ArrowDown, ArrowUp, Share2 } from "@/components/icons";
+ import { useConfig } from "@/hooks/use-config";
+ import { withBasePath } from "@/lib/browser-navigation";
++import { useAuthStore } from "@/stores/auth-store";
+ 
+ interface BeforeInstallPromptEvent extends Event {
+   prompt: () => Promise<void>;
+@@ -23,16 +24,52 @@ export function isPWAInstallPromptVisible(): boolean {
+   return promptVisible;
+ }
+ 
++/**
++ * Safari on an iPhone or iPad: the one browser there that adds a web app to the Home Screen, and it never fires
++ * beforeinstallprompt, so there is no install button to offer. An iPad asking for the desktop site says "Macintosh";
++ * its touch screen gives it away. Chrome, Firefox, Edge and Opera on iOS name themselves.
++ */
++export function isIosSafari(nav: Navigator = navigator): boolean {
++  const ua = nav.userAgent;
++  const ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && nav.maxTouchPoints > 1);
++  return ios && /Safari\//.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS|GSA\//.test(ua);
++}
++
++/** Already opened from the Home Screen, so already installed. */
++function isStandalone(): boolean {
++  return (
++    window.matchMedia?.("(display-mode: standalone)").matches === true ||
++    (navigator as Navigator & { standalone?: boolean }).standalone === true
++  );
++}
++
++/** An iPad's Safari keeps Share at the top right; an iPhone's toolbar is at the bottom. */
++function isIpad(nav: Navigator = navigator): boolean {
++  return /iPad/.test(nav.userAgent) || (/Macintosh/.test(nav.userAgent) && nav.maxTouchPoints > 1);
++}
++
+ export function PWAInstallPrompt() {
+   const [deferredPrompt, setDeferredPrompt] =
+     useState<BeforeInstallPromptEvent | null>(null);
+   const [showPrompt, setShowPrompt] = useState(false);
++  // iOS Safari: steps to follow, since there is no prompt to call.
++  const [iosSteps, setIosSteps] = useState<"iphone" | "ipad" | null>(null);
+   const { appName, faviconUrl, appLogoLightUrl, appLogoDarkUrl } = useConfig();
+   const t = useTranslations("pwa_install");
++  // The iOS steps wait for sign-in: on the sign-in page the card would sit over its controls.
++  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+ 
+   useEffect(() => {
+     if (localStorage.getItem(DISMISSED_KEY)) return;
+ 
++    if (isIosSafari()) {
++      // Signed out (or never signed in) hides it again: the sign-in page is where it would be in the way.
++      const show = isAuthenticated && !isStandalone();
++      setIosSteps(show ? (isIpad() ? "ipad" : "iphone") : null);
++      setShowPrompt(show);
++      return;
++    }
++
+     const handler = (e: Event) => {
+       e.preventDefault();
+       setDeferredPrompt(e as BeforeInstallPromptEvent);
+@@ -44,7 +81,7 @@ export function PWAInstallPrompt() {
+     return () => {
+       window.removeEventListener("beforeinstallprompt", handler);
+     };
+-  }, []);
++  }, [isAuthenticated]);
+ 
+   useEffect(() => {
+     promptVisible = showPrompt;
+@@ -80,13 +117,70 @@ export function PWAInstallPrompt() {
+     setShowPrompt(false);
+   };
+ 
+-  if (!showPrompt || !deferredPrompt) {
++  if (!showPrompt || (!deferredPrompt && !iosSteps)) {
+     return null;
+   }
+ 
+   const logoSrc = withBasePath(appLogoLightUrl || faviconUrl);
+   const darkLogoSrc = withBasePath(appLogoDarkUrl || faviconUrl);
+ 
++  if (iosSteps) {
++    // The first step's icon is the arrow, bouncing toward Safari's toolbar. On a phone the card sits above webmail's
++    // own tab bar (3.25rem and half the safe area), so it never covers it, and the arrow never lands on a tab.
++    const Arrow = iosSteps === "ipad" ? ArrowUp : ArrowDown;
++    return (
++      <div
++        role="dialog"
++        aria-label={t("title", { appName })}
++        className={`fixed z-50 inset-x-4 mx-auto max-w-sm ${iosSteps === "ipad" ? "top-4 sm:inset-x-auto sm:right-4" : "bottom-[calc(4rem+env(safe-area-inset-bottom)/2)]"}`}
++      >
++        <div className="bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-neutral-200 dark:border-neutral-800 p-4">
++          <div className="flex items-start justify-between mb-3">
++            <div>
++              <h3 className="font-semibold text-sm text-neutral-900 dark:text-white">{t("title", { appName })}</h3>
++              <p className="text-xs text-neutral-600 dark:text-neutral-400 mt-1">{t("ios_description")}</p>
++            </div>
++            <button
++              onClick={handleDismiss}
++              className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 transition-colors"
++              aria-label={t("dismiss_aria")}
++            >
++              <X className="w-4 h-4" />
++            </button>
++          </div>
++          <ol className="space-y-2 mb-3 text-sm text-neutral-800 dark:text-neutral-200">
++            <li className="flex items-start gap-2">
++              <Arrow className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400 animate-bounce" aria-hidden="true" />
++              <span>{t(iosSteps === "ipad" ? "ios_step_share_ipad" : "ios_step_share")}</span>
++            </li>
++            <li className="flex items-start gap-2">
++              <Share2 className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400" aria-hidden="true" />
++              <span>{t("ios_step_add")}</span>
++            </li>
++            <li className="flex items-start gap-2">
++              <Download className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400" aria-hidden="true" />
++              <span>{t("ios_step_confirm")}</span>
++            </li>
++          </ol>
++          <div className="flex gap-2">
++            <button
++              onClick={handleDismiss}
++              className="flex-1 px-3 py-2 text-sm font-medium text-neutral-700 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-colors"
++            >
++              {t("not_now")}
++            </button>
++            <button
++              onClick={handleDismissForever}
++              className="flex-1 px-3 py-2 text-xs text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 transition-colors"
++            >
++              {t("dont_remind")}
++            </button>
++          </div>
++        </div>
++      </div>
++    );
++  }
++
+   return (
+     <div className="fixed bottom-4 right-4 z-50 bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-neutral-200 dark:border-neutral-800 p-4 max-w-sm animate-in slide-in-from-bottom-4">
+       <div className="flex items-start justify-between mb-3">
+diff --git a/locales/en/common.json b/locales/en/common.json
+index 228f259..a1124dc 100644
+--- a/locales/en/common.json
++++ b/locales/en/common.json
+@@ -3602,7 +3602,12 @@
+     "not_now": "Not now",
+     "install": "Install",
+     "dont_remind": "Don't remind me again",
+-    "dismiss_aria": "Dismiss install prompt"
++    "dismiss_aria": "Dismiss install prompt",
++    "ios_description": "Add it to your Home Screen from Safari. It opens in its own window and can notify you of new mail.",
++    "ios_step_share": "Tap ⋯ at the bottom of the screen, then Share. If Safari shows the Share button there instead, tap it.",
++    "ios_step_share_ipad": "Tap Share at the top of the screen. If Safari shows ⋯ there instead, tap it, then Share.",
++    "ios_step_add": "Scroll down and tap Add to Home Screen.",
++    "ios_step_confirm": "Leave Open as Web App on, and tap Add."
+   },
+   "deep_link": {
+     "message_not_found": "This message is no longer available.",
