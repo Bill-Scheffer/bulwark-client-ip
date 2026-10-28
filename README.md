@@ -242,7 +242,8 @@ button, which the e2e caught, so it also goes on sign-out):
 
 1. ⋯ beside the address bar, then Share (an iPad's Share is at the top);
 2. Add to Home Screen;
-3. leave Open as Web App on, and Add.
+3. Add, leaving Open as Web App on where Safari shows it (iOS 26; iOS 18 has no such switch, so from `clientip.18`
+   the step says to leave it on only if it is there).
 
 The first step's icon is an arrow bouncing toward Safari's toolbar: down on an iPhone, where the card sits just above
 webmail's own tab bar so it never covers it, and up on an iPad, where the card is at the top right. Not now

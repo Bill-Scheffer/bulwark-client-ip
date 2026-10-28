@@ -281,7 +281,7 @@ index 228f259..a1124dc 100644
 +    "ios_step_share": "Tap ⋯ at the bottom of the screen, then Share. If Safari shows the Share button there instead, tap it.",
 +    "ios_step_share_ipad": "Tap Share at the top of the screen. If Safari shows ⋯ there instead, tap it, then Share.",
 +    "ios_step_add": "Scroll down and tap Add to Home Screen.",
-+    "ios_step_confirm": "Leave Open as Web App on, and tap Add."
++    "ios_step_confirm": "If you see Open as Web App, leave it on. Then tap Add."
    },
    "deep_link": {
      "message_not_found": "This message is no longer available.",

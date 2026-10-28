@@ -90,7 +90,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.17
+  VERSION: 1.11.2-clientip.18
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
