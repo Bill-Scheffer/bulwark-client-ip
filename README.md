@@ -246,7 +246,8 @@ button, which the e2e caught, so it also goes on sign-out):
 
 The first step's icon is an arrow bouncing toward Safari's toolbar: down on an iPhone, where the card sits just above
 webmail's own tab bar so it never covers it, and up on an iPad, where the card is at the top right. Not now
-and Don't remind me again work as before. An iPad that asks for the desktop site is told apart from a Mac by its touch
+and Don't remind me again work as before, and from `clientip.17` Don't remind me again is styled exactly as Not now is:
+upstream's faint text looked disabled on Bill's iPhone. An iPad that asks for the desktop site is told apart from a Mac by its touch
 screen. Chrome, Firefox, Edge and Opera on iOS name themselves in the user agent, and get nothing, since their steps differ.
 `components/__tests__/pwa-install-prompt-ios.test.tsx` covers which devices count, the iPhone and iPad layouts, and the
 cases that show nothing, including before sign-in; with the Home Screen check or the sign-in check removed, its case fails. [`scripts/e2e-ios-install.sh`](scripts/e2e-ios-install.sh) checks the built

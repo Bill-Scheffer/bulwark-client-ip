@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..08e4652
 --- /dev/null
 +++ b/components/__tests__/pwa-install-prompt-ios.test.tsx
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,113 @@
 +import { act, fireEvent, render, screen } from "@testing-library/react";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +import { isIosSafari, PWAInstallPrompt } from "../pwa-install-prompt";
@@ -61,6 +61,8 @@ index 0000000..08e4652
 +    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("animate-bounce");
 +    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("arrow-down");
 +    expect(screen.queryByText("install")).not.toBeInTheDocument();
++    // Don't remind me again is a button like Not now, not faint text that looks disabled (Bill's iPhone pass).
++    expect(screen.getByText("dont_remind").className).toBe(screen.getByText("not_now").className);
 +  });
 +
 +  it("shows an iPad its own first step at the top right, its arrow pointing up toward Share", () => {
@@ -252,7 +254,7 @@ index 20195bd..07d097f 100644
 +            </button>
 +            <button
 +              onClick={handleDismissForever}
-+              className="flex-1 px-3 py-2 text-xs text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 transition-colors"
++              className="flex-1 px-3 py-2 text-sm font-medium text-neutral-700 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-colors"
 +            >
 +              {t("dont_remind")}
 +            </button>
