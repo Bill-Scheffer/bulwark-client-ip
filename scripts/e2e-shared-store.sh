@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# End-to-end for 0016: two instances of the BUILT image behind no shared volume agree on a user's
+# settings and on a pairing code, through a real PostgreSQL over TLS verified against its CA, with a
+# real Stalwart for the sign-in. The client side is e2e-shared-store.mjs. Throwaway containers and
+# credentials, removed on exit.
+# Usage: e2e-shared-store.sh <image> [shared|separate]
+#   shared:   SHARED_STORE=postgres on both instances; also checks a wrong CA is refused, loudly.
+#   separate: the negative control, both instances WITHOUT SHARED_STORE (or an image before 0016):
+#             each keeps its own settings and its own codes, which is what two pods did before.
+set -euo pipefail
+IMAGE="$1"
+EXPECT="${2:-shared}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+STALWART=stalwartlabs/stalwart:v0.16.24
+CLI=stalwartlabs/cli:1.0.13
+PG=postgres:18.4
+NET=e2e-shared
+ADMIN_PW="$(openssl rand -hex 16)"
+USER_PW="$(openssl rand -hex 16)"
+PG_PW="$(openssl rand -hex 16)"
+SECRET="$(openssl rand -hex 32)"
+DATA=""
+NAMES="e2e-ss-stalwart e2e-ss-pg e2e-ss-bw1 e2e-ss-bw2 e2e-ss-bwbad"
+cleanup() { docker rm -f $NAMES >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; [ -z "$DATA" ] || rm -rf "$DATA" 2>/dev/null || true; }
+trap cleanup EXIT
+cleanup
+DATA="$(mktemp -d)"
+mkdir -p "$DATA/etc" "$DATA/data" "$DATA/tls"
+echo '{"@type":"RocksDb","path":"/var/lib/stalwart/"}' > "$DATA/etc/config.json"
+chmod -R 777 "$DATA/etc" "$DATA/data"
+docker network create "$NET" >/dev/null
+
+# A private CA and a server certificate for the database's name, as CNPG serves; and a second CA
+# that signed nothing, for the refusal.
+(
+  cd "$DATA/tls"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=e2e-ca -keyout ca.key -out ca.crt 2>/dev/null
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=e2e-other-ca -keyout other.key -out other-ca.crt 2>/dev/null
+  openssl req -newkey rsa:2048 -nodes -subj /CN=e2e-pg -keyout server.key -out server.csr 2>/dev/null
+  printf 'subjectAltName=DNS:e2e-pg\n' > san.ext
+  openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt 2>/dev/null
+  chmod 644 ca.crt other-ca.crt
+)
+
+docker run -d --name e2e-ss-pg --network "$NET" --network-alias e2e-pg \
+  -e POSTGRES_USER=bulwark -e POSTGRES_PASSWORD="$PG_PW" -e POSTGRES_DB=bulwark "$PG" >/dev/null
+# Over TCP: the image's first-start init runs a temporary server on the socket only, which a socket check mistakes for ready.
+pg_up=
+for _ in $(seq 1 60); do docker exec e2e-ss-pg pg_isready -h 127.0.0.1 -U bulwark -d bulwark >/dev/null 2>&1 && { pg_up=1; break; }; sleep 1; done
+[ -n "$pg_up" ] || { docker logs e2e-ss-pg | tail -20; echo "::error::the database did not start"; exit 1; }
+docker cp "$DATA/tls/server.crt" e2e-ss-pg:/var/lib/postgresql/server.crt
+docker cp "$DATA/tls/server.key" e2e-ss-pg:/var/lib/postgresql/server.key
+docker exec -u root e2e-ss-pg sh -c 'chown postgres /var/lib/postgresql/server.* && chmod 600 /var/lib/postgresql/server.key'
+docker exec e2e-ss-pg psql -qU bulwark -d bulwark -c "ALTER SYSTEM SET ssl = on" \
+  -c "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.crt'" \
+  -c "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key'" -c "SELECT pg_reload_conf()" >/dev/null
+sleep 1
+[ "$(docker exec e2e-ss-pg psql -tAU bulwark -d bulwark -c 'SHOW ssl')" = on ] || { echo "::error::the database did not turn TLS on"; exit 1; }
+
+docker run -d --name e2e-ss-stalwart --hostname mail.e2e.test --network "$NET" --network-alias e2e-stalwart \
+  -e STALWART_RECOVERY_ADMIN="admin:$ADMIN_PW" \
+  -v "$DATA/etc:/etc/stalwart" -v "$DATA/data:/var/lib/stalwart" "$STALWART" >/dev/null
+cli() { docker run --rm --network "$NET" -e STALWART_URL=http://e2e-stalwart:8080 -e STALWART_USER=admin \
+  -e STALWART_PASSWORD="$ADMIN_PW" "$CLI" --no-color "$@"; }
+for _ in $(seq 1 60); do
+  docker run --rm --network "$NET" node:24-alpine node -e 'fetch("http://e2e-stalwart:8080/healthz/ready").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' 2>/dev/null && break
+  sleep 1
+done
+domain=$(cli create Domain --json '{"name":"e2e.test","dkimManagement":{"@type":"Manual"},"dnsManagement":{"@type":"Manual"}}' | awk '/Created Domain/ {print $3}')
+cli create Account/User --json "{\"name\":\"u\",\"domainId\":\"$domain\",\"credentials\":{\"0\":{\"@type\":\"Password\",\"secret\":\"$USER_PW\"}}}"
+
+# The same environment on every instance, as one Deployment's pods have; only the store differs by mode.
+# OAUTH_CLIENT_ID: minting a pairing code needs it (getRequiredConfig); the password sign-in falls back to the same id.
+bulwark() {
+  local name="$1" ca="$2"; shift 2
+  local store=()
+  if [ "$EXPECT" = shared ]; then
+    store=(-e SHARED_STORE=postgres -e PGHOST=e2e-pg -e PGDATABASE=bulwark -e PGUSER=bulwark -e PGPASSWORD="$PG_PW"
+           -e PGSSLROOTCERT=/tls/ca.crt -v "$DATA/tls/$ca:/tls/ca.crt:ro")
+  fi
+  docker run -d --name "$name" --network "$NET" --network-alias "$name" \
+    -e JMAP_SERVER_URL=https://mail.e2e.test -e JMAP_SERVER_INTERNAL_URL=http://e2e-stalwart:8080 \
+    -e JMAP_FORWARD_CLIENT_IP=true -e STALWART_FEATURES=true -e COOKIE_SECURE=false \
+    -e SETTINGS_SYNC_ENABLED=true -e SESSION_SECRET="$SECRET" -e OAUTH_CLIENT_ID=bulwark-webmail "${store[@]}" "$IMAGE" >/dev/null
+}
+healthy() {
+  for _ in $(seq 1 60); do
+    docker exec "$1" node -e 'fetch("http://127.0.0.1:3000/api/health").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' 2>/dev/null && return 0
+    sleep 1
+  done
+  docker logs "$1" | tail -20; echo "::error::$1 did not become healthy"; exit 1
+}
+bulwark e2e-ss-bw1 ca.crt
+bulwark e2e-ss-bw2 ca.crt
+healthy e2e-ss-bw1
+healthy e2e-ss-bw2
+
+if [ "$EXPECT" = shared ]; then
+  for n in e2e-ss-bw1 e2e-ss-bw2; do
+    docker logs "$n" 2>&1 | grep -q 'Shared store: ready (postgres)' || { docker logs "$n" 2>&1 | tail -20; echo "::error::$n did not report its shared store ready"; exit 1; }
+  done
+  echo "both instances: Shared store: ready (postgres), over TLS verified against the database's CA"
+  # A CA that did not sign the database's certificate is refused at start, loudly, and the store
+  # stays closed rather than falling back to a file.
+  bulwark e2e-ss-bwbad other-ca.crt
+  healthy e2e-ss-bwbad
+  docker logs e2e-ss-bwbad 2>&1 | grep -q 'Shared store: FAILED' \
+    || { docker logs e2e-ss-bwbad 2>&1 | tail -20; echo "::error::an instance with the wrong CA did not report its store FAILED"; exit 1; }
+  echo "an instance trusting another CA: Shared store: FAILED, as it should"
+fi
+
+docker run --rm --network "$NET" -v "$HERE/e2e-shared-store.mjs:/e2e.mjs:ro" node:24-alpine \
+  node /e2e.mjs http://e2e-ss-bw1:3000 http://e2e-ss-bw2:3000 http://e2e-ss-bwbad:3000 http://e2e-stalwart:8080 \
+  https://mail.e2e.test u@e2e.test "$USER_PW" "$SECRET" "$EXPECT" \
+  || { for n in e2e-ss-bw1 e2e-ss-bw2; do echo "--- $n"; docker logs "$n" 2>&1 | tail -20; done; exit 1; }
+
+if [ "$EXPECT" = shared ]; then
+  # What the database holds: the blob and the code's hash, never the code or a token in clear.
+  rows=$(docker exec e2e-ss-pg psql -tAU bulwark -d bulwark -c "SELECT (SELECT count(*) FROM bulwark_settings) || ' ' || (SELECT count(*) FROM bulwark_pairing)")
+  echo "rows: settings and pairing = $rows"
+  [ "$rows" = "1 0" ] || { echo "::error::expected one settings row and no pairing row left, got $rows"; exit 1; }
+fi
+echo "OK ($EXPECT)"

@@ -255,6 +255,40 @@ cases that show nothing, including before sign-in; with the Home Screen check or
 image in demo mode: WebKit as an iPhone gets the three steps and no Install button, and Chrome as an Android phone does
 not get them. `OUT=<dir>` saves the iPhone's screenshot for review (MainThrive MAI-1181).
 
+## Two or more instances share settings and pairing codes (`0016`, `clientip.19`)
+
+[`patches/0016-shared-store-postgres.patch`](patches/0016-shared-store-postgres.patch). Upstream targets one instance:
+each user's synced settings are a file (`data/settings/<sha256>.enc`), and the QR device-pairing codes are an in-process
+`Map` (`lib/auth/pairing-store.ts` says a multi-instance deployment would need a shared store). Behind a load balancer two
+instances disagree on both: a setting saved on one is missing on the other, and about half the redeems of a pairing code
+land on the instance that never minted it. Sessions need nothing: they are AES-GCM cookies under the shared
+`SESSION_SECRET`.
+
+With `SHARED_STORE=postgres`, `lib/server/shared-store.ts` keeps both in PostgreSQL, connecting with the standard `PG*`
+variables:
+
+| Table | Holds |
+|---|---|
+| `bulwark_settings` | the same encrypted blob the file held, under the file's name as its key. Nothing is decrypted or re-encrypted, so a legacy file can be copied in as-is |
+| `bulwark_pairing` | each code's SHA-256 (never the code), the tokens encrypted under `SESSION_SECRET` (purpose `pairing`), and an expiry by the database's clock. One `DELETE … RETURNING` redeems it, so a code is single-use across every instance |
+
+The tables are created at start, under an advisory lock so two instances starting together cannot race. TLS is verified:
+against `PGSSLROOTCERT` when set (a private CA, such as CloudNativePG's), else the system's CAs; `PGSSLMODE=disable`
+turns it off, for tests. ⛔ **It fails closed**: with the store on and the database unreachable, a settings save or load
+answers 500 (the browser keeps its own copy, as upstream's client already does on an error) and a pairing fails; it
+never falls back to the file or the `Map`, where the instances would disagree. Each instance logs
+`Shared store: ready (postgres)` at start, or `Shared store: FAILED …` with the reason. The only dependency added is
+`pg` (8.23.1, with `@types/pg`). Unset, nothing changes.
+
+`lib/__tests__/shared-store.test.ts` runs two instances (two module graphs) over one database: settings and codes cross
+between them, a code redeems once, an expired one is refused, the row holds no plaintext, and with the database down
+every call fails and no file is written. [`scripts/e2e-shared-store.sh`](scripts/e2e-shared-store.sh) runs two
+instances of the built image with a real Stalwart and a real PostgreSQL over TLS with a private CA: a save on each
+instance is what the other loads, a code minted on one redeems on the other (and its access token opens a JMAP session)
+and never again on either, and an instance trusting another CA logs `FAILED` and answers 500 rather than serving local
+settings. Its `separate` mode, the same two instances with the store off, is the negative control: each keeps its own
+(MainThrive MAI-1406).
+
 ## Verified
 
 The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit

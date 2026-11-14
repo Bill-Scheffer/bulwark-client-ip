@@ -1,4 +1,4 @@
-# Builds Bulwark from its own release source with fifteen patches:
+# Builds Bulwark from its own release source with sixteen patches:
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
@@ -55,6 +55,10 @@
 #     Install card shows the Add to Home Screen steps, with an arrow toward Safari's toolbar, instead of never
 #     appearing. Once signed in, never once the app is opened from the Home Screen, nor in another iOS browser
 #     (MainThrive MAI-1181).
+#   0016-shared-store-postgres.patch: with SHARED_STORE=postgres, the settings-sync blobs and the device-pairing codes,
+#     which upstream keeps in files and in process memory, live in PostgreSQL instead, so two or more instances behind one
+#     load balancer agree on both (MainThrive MAI-1406). Same blob, same key, TLS verified; it fails closed, never
+#     falling back to a local file. Adds the `pg` dependency. Off, nothing changes.
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes. The release tag is pushed only from main; a dispatch
 # from another branch pushes branch-<short sha> instead, and a pull request runs every step but the
@@ -90,7 +94,7 @@ env:
   BULWARK_TAG: "1.11.2"
   BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.18
+  VERSION: 1.11.2-clientip.19
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -176,7 +180,8 @@ jobs:
                    ../patch/patches/0012-totp-issuer-is-app-name.patch \
                    ../patch/patches/0013-mobile-send-returns-to-list.patch \
                    ../patch/patches/0014-password-change-asks-for-the-next-code.patch \
-                   ../patch/patches/0015-ios-safari-install-steps.patch; do
+                   ../patch/patches/0015-ios-safari-install-steps.patch \
+                   ../patch/patches/0016-shared-store-postgres.patch; do
             git apply --check "$p"
             git apply "$p"
           done
@@ -195,7 +200,10 @@ jobs:
             '?? components/settings/__tests__/account-security-totp-issuer.test.tsx' \
             ' M components/mail/mail-app.tsx' \
             ' M locales/en/common.json' '?? components/settings/__tests__/account-security-next-code.test.tsx' \
-            ' M components/pwa-install-prompt.tsx' '?? components/__tests__/pwa-install-prompt-ios.test.tsx' | LC_ALL=C sort | tr '\n' '|')
+            ' M components/pwa-install-prompt.tsx' '?? components/__tests__/pwa-install-prompt-ios.test.tsx' \
+            ' M app/api/auth/pair/create/route.ts' ' M app/api/auth/pair/redeem/route.ts' ' M lib/auth/crypto.ts' \
+            ' M lib/auth/pairing-store.ts' ' M lib/settings-sync.ts' ' M package.json' ' M package-lock.json' \
+            '?? lib/__tests__/shared-store.test.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
           # 0008: the Files page renders no stability banner.
           ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
@@ -226,6 +234,15 @@ jobs:
           # 0015: iOS Safari gets the install steps once signed in, and only while the app is not opened from the Home Screen.
           grep -qF 'const show = isAuthenticated && !isStandalone();' components/pwa-install-prompt.tsx \
             || { echo "::error::iOS Safari still gets no install card"; exit 1; }
+          # 0016: settings and pairing go to the shared store when it is on, and both pair routes wait for it; the only
+          # dependency added is pg (and its types).
+          grep -qF 'if (shared) return putSettingsBlob(settingsKey(username, serverUrl), data);' lib/settings-sync.ts \
+            && grep -qF 'const blob = await takePairing(codeHash(code));' lib/auth/pairing-store.ts \
+            && grep -qF 'await createPairing({' app/api/auth/pair/create/route.ts \
+            && grep -qF 'await consumePairing(pairingCode)' app/api/auth/pair/redeem/route.ts \
+            || { echo "::error::settings or pairing codes still stay per instance with the shared store on"; exit 1; }
+          [ "$(git diff -U0 package.json | grep -E '^\+ ' | tr -d ' ' | LC_ALL=C sort | tr '\n' '|')" = '+"@types/pg":"8.23.1",|+"pg":"8.23.1",|' ] \
+            || { echo "::error::package.json changed beyond pg 8.23.1 and its types"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
@@ -246,7 +263,8 @@ jobs:
             components/settings/__tests__/account-security-token-session.test.tsx \
             components/settings/__tests__/account-security-totp-issuer.test.tsx \
             components/settings/__tests__/account-security-next-code.test.tsx \
-            components/__tests__/pwa-install-prompt.test.tsx components/__tests__/pwa-install-prompt-ios.test.tsx
+            components/__tests__/pwa-install-prompt.test.tsx components/__tests__/pwa-install-prompt-ios.test.tsx \
+            lib/__tests__/shared-store.test.ts lib/__tests__/settings-route-account-key.test.ts
           npx tsc --noEmit -p tsconfig.json
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
@@ -289,6 +307,12 @@ jobs:
 
       - name: End-to-end, Safari on an iPhone - the Install card shows the Add to Home Screen steps
         run: bash patch/scripts/e2e-ios-install.sh "${IMAGE}:${VERSION}"
+
+      - name: End-to-end, two instances and a real PostgreSQL - settings and a pairing code shared across them
+        run: bash patch/scripts/e2e-shared-store.sh "${IMAGE}:${VERSION}" shared
+
+      - name: End-to-end, the same two instances with the store off - each keeps its own (the negative control)
+        run: bash patch/scripts/e2e-shared-store.sh "${IMAGE}:${VERSION}" separate
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,
