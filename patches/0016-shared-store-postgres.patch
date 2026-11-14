@@ -67,10 +67,10 @@ index 69b7aff..5edc4cb 100644
  );
 diff --git a/lib/__tests__/shared-store.test.ts b/lib/__tests__/shared-store.test.ts
 new file mode 100644
-index 0000000..c79e996
+index 0000000..86f972c
 --- /dev/null
 +++ b/lib/__tests__/shared-store.test.ts
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,255 @@
 +// @vitest-environment node
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +import { createHash } from 'node:crypto';
@@ -313,6 +313,18 @@ index 0000000..c79e996
 +    await a.store.sharedStore();
 +    expect(db.configs).toEqual([expect.objectContaining({ ssl })]);
 +  });
++
++  it('re-reads the CA at each connection, so a renewed CA needs no restart', async () => {
++    const ca = path.join(dir, 'ca.crt');
++    writeFileSync(ca, 'OLD-CA');
++    vi.stubEnv('PGSSLROOTCERT', ca);
++    const a = await instance();
++    await a.store.sharedStore();
++    const ssl = (db.configs[0] as { ssl: { ca: string } }).ssl;
++    expect({ ...ssl }).toEqual({ ca: 'OLD-CA' });
++    writeFileSync(ca, 'NEW-CA');
++    expect({ ...ssl }).toEqual({ ca: 'NEW-CA' });
++  });
 +});
 diff --git a/lib/auth/crypto.ts b/lib/auth/crypto.ts
 index ac39563..8571910 100644
@@ -401,10 +413,10 @@ index 2604143..e0920ff 100644
    const record = store.get(code);
 diff --git a/lib/server/shared-store.ts b/lib/server/shared-store.ts
 new file mode 100644
-index 0000000..c5d8ff4
+index 0000000..a6d65dc
 --- /dev/null
 +++ b/lib/server/shared-store.ts
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,150 @@
 +import { readFileSync } from 'node:fs';
 +import { Pool, type PoolConfig } from 'pg';
 +import { logger } from '@/lib/logger';
@@ -453,7 +465,9 @@ index 0000000..c5d8ff4
 +    idleTimeoutMillis: 300_000,
 +    connectionTimeoutMillis: 5_000,
 +    query_timeout: 5_000,
-+    ssl: mode === 'disable' ? false : ca ? { ca: readFileSync(ca, 'utf8') } : true,
++    // The CA is read at each new connection, not once: a mounted Secret is updated in place when CNPG renews its CA,
++    // and a pod that outlived the old one would otherwise refuse every new connection until restarted.
++    ssl: mode === 'disable' ? false : ca ? { get ca() { return readFileSync(ca, 'utf8'); } } : true,
 +  };
 +}
 +
