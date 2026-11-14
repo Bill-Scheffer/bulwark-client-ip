@@ -67,10 +67,10 @@ index 69b7aff..5edc4cb 100644
  );
 diff --git a/lib/__tests__/shared-store.test.ts b/lib/__tests__/shared-store.test.ts
 new file mode 100644
-index 0000000..8cd3afb
+index 0000000..c79e996
 --- /dev/null
 +++ b/lib/__tests__/shared-store.test.ts
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,243 @@
 +// @vitest-environment node
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 +import { createHash } from 'node:crypto';
@@ -301,24 +301,17 @@ index 0000000..8cd3afb
 +  });
 +});
 +
-+describe('the connection', () => {
-+  it('verifies TLS by default, against PGSSLROOTCERT when given, and turns it off only for PGSSLMODE=disable', async () => {
-+    const ca = path.join(dir, 'ca.crt');
-+    writeFileSync(ca, 'CA-PEM');
-+    const cases: Array<[Record<string, string>, unknown]> = [
-+      [{}, true],
-+      [{ PGSSLROOTCERT: ca }, { ca: 'CA-PEM' }],
-+      [{ PGSSLMODE: 'disable' }, false],
-+    ];
-+    for (const [env, ssl] of cases) {
-+      for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
-+      db.configs = [];
-+      const a = await instance();
-+      await a.store.sharedStore();
-+      expect(db.configs).toEqual([expect.objectContaining({ ssl })]);
-+      vi.stubEnv('PGSSLROOTCERT', '');
-+      vi.stubEnv('PGSSLMODE', '');
-+    }
++describe('the connection verifies TLS by default, against PGSSLROOTCERT when given, and turns it off only for PGSSLMODE=disable', () => {
++  it.each<[string, Record<string, string>, unknown]>([
++    ['default', {}, true],
++    ['a private CA', { PGSSLROOTCERT: 'ca.crt' }, { ca: 'CA-PEM' }],
++    ['disable', { PGSSLMODE: 'disable' }, false],
++  ])('%s', async (_label, env, ssl) => {
++    writeFileSync(path.join(dir, 'ca.crt'), 'CA-PEM');
++    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, k === 'PGSSLROOTCERT' ? path.join(dir, v) : v);
++    const a = await instance();
++    await a.store.sharedStore();
++    expect(db.configs).toEqual([expect.objectContaining({ ssl })]);
 +  });
 +});
 diff --git a/lib/auth/crypto.ts b/lib/auth/crypto.ts
@@ -345,7 +338,7 @@ index ac39563..8571910 100644
  
  export function encryptPayload(payload: Record<string, unknown>, purpose: PayloadPurpose): string {
 diff --git a/lib/auth/pairing-store.ts b/lib/auth/pairing-store.ts
-index 2604143..21f37d6 100644
+index 2604143..e0920ff 100644
 --- a/lib/auth/pairing-store.ts
 +++ b/lib/auth/pairing-store.ts
 @@ -1,4 +1,6 @@
@@ -368,26 +361,28 @@ index 2604143..21f37d6 100644
  
  export interface PairingTokens {
    accessToken: string;
-@@ -39,10 +46,16 @@ function sweep(now: number): void {
+@@ -39,18 +46,32 @@ function sweep(now: number): void {
    }
  }
  
 -export function createPairing(tokens: PairingTokens): { code: string; expiresIn: number } {
+-  const now = Date.now();
+-  sweep(now);
 +const codeHash = (code: string): Buffer => createHash('sha256').update(code).digest();
 +
 +export async function createPairing(tokens: PairingTokens): Promise<{ code: string; expiresIn: number }> {
-+  const code = randomBytes(CODE_BYTES).toString('hex');
+   const code = randomBytes(CODE_BYTES).toString('hex');
+-  store.set(code, { ...tokens, expiresAt: now + PAIRING_TTL_MS });
 +  if (sharedStoreEnabled()) {
 +    await putPairing(codeHash(code), encryptPayload({ ...tokens }, 'pairing'), PAIRING_TTL_MS);
-+    return { code, expiresIn: Math.floor(PAIRING_TTL_MS / 1000) };
++  } else {
++    const now = Date.now();
++    sweep(now);
++    store.set(code, { ...tokens, expiresAt: now + PAIRING_TTL_MS });
 +  }
-   const now = Date.now();
-   sweep(now);
--  const code = randomBytes(CODE_BYTES).toString('hex');
-   store.set(code, { ...tokens, expiresAt: now + PAIRING_TTL_MS });
    return { code, expiresIn: Math.floor(PAIRING_TTL_MS / 1000) };
  }
-@@ -50,7 +63,15 @@ export function createPairing(tokens: PairingTokens): { code: string; expiresIn:
+ 
  // Single-use: a successful lookup removes the record so a code can never be
  // redeemed twice. Returns null for unknown, expired, or already-redeemed codes
  // — the caller must not distinguish these to avoid leaking code validity.
@@ -406,10 +401,10 @@ index 2604143..21f37d6 100644
    const record = store.get(code);
 diff --git a/lib/server/shared-store.ts b/lib/server/shared-store.ts
 new file mode 100644
-index 0000000..aace803
+index 0000000..c5d8ff4
 --- /dev/null
 +++ b/lib/server/shared-store.ts
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,148 @@
 +import { readFileSync } from 'node:fs';
 +import { Pool, type PoolConfig } from 'pg';
 +import { logger } from '@/lib/logger';
@@ -454,7 +449,8 @@ index 0000000..aace803
 +  const ca = process.env.PGSSLROOTCERT;
 +  return {
 +    max: 4,
-+    idleTimeoutMillis: 30_000,
++    // Settings traffic is sparse: keep a connection long enough that a save rarely pays a new TLS + SCRAM handshake.
++    idleTimeoutMillis: 300_000,
 +    connectionTimeoutMillis: 5_000,
 +    query_timeout: 5_000,
 +    ssl: mode === 'disable' ? false : ca ? { ca: readFileSync(ca, 'utf8') } : true,
@@ -557,16 +553,8 @@ index 0000000..aace803
 +    console.error('Shared store: FAILED to connect or create its schema:', err instanceof Error ? err.message : err);
 +  }
 +}
-+
-+/** Test hook. */
-+export async function resetSharedStoreForTests(): Promise<void> {
-+  const p = pool;
-+  pool = null;
-+  ready = null;
-+  await p?.end().catch(() => undefined);
-+}
 diff --git a/lib/settings-sync.ts b/lib/settings-sync.ts
-index 6a5fb1b..3008b22 100644
+index 6a5fb1b..515480b 100644
 --- a/lib/settings-sync.ts
 +++ b/lib/settings-sync.ts
 @@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
@@ -612,34 +600,22 @@ index 6a5fb1b..3008b22 100644
    const targetPath = getSettingsPath(username, serverUrl);
    const tmpPath = targetPath + '.tmp';
    await writeFile(tmpPath, data);
-@@ -53,10 +60,17 @@ export async function saveUserSettings(username: string, serverUrl: string, sett
+@@ -53,10 +60,13 @@ export async function saveUserSettings(username: string, serverUrl: string, sett
  }
  
  export async function loadUserSettings(username: string, serverUrl: string): Promise<Record<string, unknown> | null> {
--  const filePath = getSettingsPath(username, serverUrl);
-+  // A shared store that cannot be read throws: the caller answers an error rather than "no settings".
-+  const data = sharedStoreEnabled()
-+    ? await getSettingsBlob(settingsKey(username, serverUrl))
-+    : await readFile(getSettingsPath(username, serverUrl)).catch((error: NodeJS.ErrnoException) => {
-+        if (error.code === 'ENOENT') return null;
-+        logger.warn('Failed to load user settings', { error: error.message });
-+        return null;
-+      });
-+  if (!data) return null;
++  // Outside the try: a shared store that cannot be read throws, so the caller answers an error, not "no settings".
++  const stored = sharedStoreEnabled() ? await getSettingsBlob(settingsKey(username, serverUrl)) : undefined;
++  if (stored === null) return null;
+   const filePath = getSettingsPath(username, serverUrl);
  
    try {
 -    const data = await readFile(filePath);
++    const data = stored ?? await readFile(filePath);
      if (data.length < IV_LENGTH + TAG_LENGTH) return null;
  
      const key = getKey();
-@@ -70,13 +84,13 @@ export async function loadUserSettings(username: string, serverUrl: string): Pro
-     const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-     return JSON.parse(decrypted.toString('utf8'));
-   } catch (error) {
--    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-     logger.warn('Failed to load user settings', { error: error instanceof Error ? error.message : 'Unknown error' });
-     return null;
-   }
+@@ -77,6 +87,7 @@ export async function loadUserSettings(username: string, serverUrl: string): Pro
  }
  
  export async function deleteUserSettings(username: string, serverUrl: string): Promise<void> {

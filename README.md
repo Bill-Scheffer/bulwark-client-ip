@@ -308,7 +308,8 @@ fresh, 401 after.
 Upstream's full suite passes with the patches applied except tests that fail on unpatched 1.11.2
 too: `health-route` and `idn` when 0001 was measured, and `health-route` and `birthday-calendar` (on a
 Node 22 host) when 0003 was, and the same two when 0011 was (4862 passed; both fail identically with
-0011 reverted).
+0011 reverted). When 0016 was measured (Node 22 host): 4877 passed, and the 26 failures are all
+`translations.test.ts`, every locale missing the English-only keys 0014 and 0015 add; 0016 adds no locale key.
 
 Image: `ghcr.io/bill-scheffer/bulwark-client-ip:<bulwark tag>-clientip.N`. Pin it by digest.
 

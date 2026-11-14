@@ -46,20 +46,20 @@ if (ctx.status !== 200) fail(`context sync answered ${ctx.status}: ${await ctx.t
 console.log(`signed in on instance 1; cookies: ${[...jar.keys()].join(', ')}`);
 
 // 2. Settings: each instance saves a different value, and each must load the other's.
-async function save(base, label, value) {
+async function save(base, value) {
   const res = await call(base, jar, '/api/settings', {
-    method: 'POST', body: JSON.stringify({ username: USER, serverUrl: SERVER, settings: { e2eMarker: value, theme: value === 'from-1' ? 'dark' : 'light' } }),
+    method: 'POST', body: JSON.stringify({ username: USER, serverUrl: SERVER, settings: { e2eMarker: value } }),
   });
-  if (res.status !== 200) fail(`${label}: settings save answered ${res.status}: ${await res.text()}`);
+  return res.status;
 }
 async function load(base) {
   const res = await call(base, jar, '/api/settings', { headers: { 'x-settings-username': USER, 'x-settings-server': SERVER } });
   return { status: res.status, settings: res.status === 200 ? (await res.json()).settings : null };
 }
-await save(BW1, 'instance 1', 'from-1');
+if (await save(BW1, 'from-1') !== 200) fail('instance 1: settings save failed');
 const on2 = await load(BW2);
 console.log(`saved on 1, loaded on 2: ${on2.status} ${JSON.stringify(on2.settings)}`);
-await save(BW2, 'instance 2', 'from-2');
+if (await save(BW2, 'from-2') !== 200) fail('instance 2: settings save failed');
 const on1 = await load(BW1);
 console.log(`saved on 2, loaded on 1: ${on1.status} ${JSON.stringify(on1.settings)}`);
 if (SHARED) {
@@ -113,9 +113,9 @@ if (SHARED) {
 // 4. A store that refused the database is an error, never "no settings" and never a local file.
 if (SHARED) {
   const bad = await load(BWBAD);
-  const badSave = await call(BWBAD, jar, '/api/settings', { method: 'POST', body: JSON.stringify({ username: USER, serverUrl: SERVER, settings: { e2eMarker: 'bad' } }) });
-  console.log(`the wrong-CA instance: load ${bad.status}, save ${badSave.status}`);
-  if (bad.status !== 500 || badSave.status !== 500) fail('the wrong-CA instance did not fail closed');
+  const badSave = await save(BWBAD, 'bad');
+  console.log(`the wrong-CA instance: load ${bad.status}, save ${badSave}`);
+  if (bad.status !== 500 || badSave !== 500) fail('the wrong-CA instance did not fail closed');
   const after = await load(BW1);
   if (after.settings?.e2eMarker !== 'from-2') fail('the wrong-CA instance changed the shared settings');
 }
