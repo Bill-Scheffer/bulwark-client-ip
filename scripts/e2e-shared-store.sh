@@ -107,14 +107,17 @@ client() { # mode -> runs e2e-shared-store.mjs in that mode
     || { for n in e2e-ss-old e2e-ss-bw1 e2e-ss-bw2; do echo "--- $n"; docker logs "$n" 2>&1 | tail -20; done; exit 1; }
 }
 psql() { docker exec e2e-ss-pg psql -tAU bulwark -d bulwark -c "$1"; }
+# A container's log, read whole, then matched: `docker logs | grep -q` under pipefail fails when grep stops at its first
+# match and docker logs dies of SIGPIPE, which read as a missing line on a log that had it (MAI-1442, CI run 44460987695).
+logged() { local out; out=$(docker logs "$1" 2>&1); grep -qE -- "$2" <<<"$out"; }
 
 if [ "$EXPECT" = upgrade ]; then
   # Today's image, on the same database, saves the user's settings into its own table first.
   bulwark e2e-ss-old ca.crt "$OLD_IMAGE"
   healthy e2e-ss-old /api/health
   # It connects after it starts serving, so the line comes a moment after the first 200.
-  for _ in $(seq 1 30); do docker logs e2e-ss-old 2>&1 | grep -q 'Shared store: ready (postgres)' && break; sleep 1; done
-  docker logs e2e-ss-old 2>&1 | grep -q 'Shared store: ready (postgres)' || { docker logs e2e-ss-old 2>&1 | tail -20; echo "::error::the old image did not report its store ready"; exit 1; }
+  for _ in $(seq 1 30); do logged e2e-ss-old 'Shared store: ready \(postgres\)' && break; sleep 1; done
+  logged e2e-ss-old 'Shared store: ready \(postgres\)' || { docker logs e2e-ss-old 2>&1 | tail -20; echo "::error::the old image did not report its store ready"; exit 1; }
   client seed-old
   [ "$(psql 'SELECT count(*) FROM bulwark_settings')" = 1 ] || { echo "::error::the old image left no settings row"; exit 1; }
   old_blob=$(psql "SELECT md5(blob) FROM bulwark_settings")
@@ -129,8 +132,8 @@ healthy e2e-ss-bw2
 
 if [ "$EXPECT" != separate ]; then
   for n in e2e-ss-bw1 e2e-ss-bw2; do
-    docker logs "$n" 2>&1 | grep -q 'Using a shared store.*postgres://bulwark@e2e-pg/bulwark' \
-      && docker logs "$n" 2>&1 | grep -q 'Shared store ready' \
+    logged "$n" 'Using a shared store.*postgres://bulwark@e2e-pg/bulwark' \
+      && logged "$n" 'Shared store ready' \
       || { docker logs "$n" 2>&1 | tail -20; echo "::error::$n did not report the postgres shared store ready"; exit 1; }
   done
   echo "both instances: Shared store ready (postgres://bulwark@e2e-pg/bulwark), over TLS verified against the database's CA"
@@ -155,7 +158,7 @@ if [ "$EXPECT" = shared ]; then
   healthy e2e-ss-bwbad /api/health
   sleep 8
   [ "$(probe e2e-ss-bwbad /api/ready)" = 503 ] || { echo "::error::an instance with the wrong CA reports ready"; exit 1; }
-  docker logs e2e-ss-bwbad 2>&1 | grep -q 'Waiting for the shared store' \
+  logged e2e-ss-bwbad 'Waiting for the shared store' \
     || { docker logs e2e-ss-bwbad 2>&1 | tail -20; echo "::error::an instance with the wrong CA did not say it is waiting for its store"; exit 1; }
   echo "an instance trusting another CA: waiting for its shared store, not ready, as it should"
 fi
