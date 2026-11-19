@@ -1,7 +1,36 @@
 # bulwark-client-ip
 
-[Bulwark](https://github.com/bulwarkmail/webmail) built from its own release source with **one**
-change, so that a mail server behind it sees each visitor's real IP address on server-side requests.
+[Bulwark](https://github.com/bulwarkmail/webmail) built from its own release source (**1.21.2**) with eight small
+changes for MainThrive's webmail. The first, and the reason this repository exists, makes a mail server behind it see
+each visitor's real IP address on server-side requests.
+
+| Patch | What it does | Upstream main checked (1d9b3cd41, 2026-11-18) |
+|---|---|---|
+| `0001` | server-side JMAP requests go to a private URL and carry the visitor's IP, failing closed | not there: upstream forwards the address on some routes since 1.16, but sends nothing when it has none |
+| `0002` | the push relay is a build argument (ours), never the hosted one | not there: the Dockerfile still passes no relay argument |
+| `0004` | the notification badge has its own image | not there: `#1516` is the app-icon unread badge, a different thing |
+| `0005` | the push preview says why it answered 401 | not there: those 401s are still silent |
+| `0007` | the preview rebuilds a two-step sign-in whose browser restarted | not there: upstream rebuilds a remembered Basic sign-in only |
+| `0015` | the Install card shows iPhone and iPad Safari the Add to Home Screen steps | not there: the card still waits for `beforeinstallprompt` |
+| `0016` | upstream's shared store on PostgreSQL | not there: the store is still local or Redis |
+| `0017` | no "Link mobile app" card | MainThrive's own choice, not an upstream gap |
+
+## Retired patches (MainThrive MAI-1442, at 1.21.2)
+
+Each was checked against upstream's source at 1.21.2 before it was dropped, and the behaviour it gave is in an
+end-to-end check below where one applies.
+
+| Patch | Upstream now | Where |
+|---|---|---|
+| `0003` push preview renews an expired token | the preview renews with the slot's refresh token, one redemption shared per process, deleting nothing on a refusal | `#1509`, `lib/stalwart/push-token-renewal.ts`; `e2e-preview-renewal.sh` steps 4-6 |
+| `0006` push preview restores a remembered sign-in | `readPushAuthContext` rebuilds it from the 30-day cookie | `lib/stalwart/push-auth-context.ts`; `e2e-preview-renewal.sh` step 8 |
+| `0008` no Files stability banner | the banner is gone | `d07939fc0` (1.14) |
+| `0009` Files upload errors say why | the toast carries the server's reason, and each refused file is reported | `components/files/files-app.tsx` `failureReason` |
+| `0010` a sign-in survives an outage | the restore treats a timeout and `CORS_ERROR` as an outage | `#1167` (1.14), the same test file name |
+| `0011` two-step sign-ins keep their account security | a password plus two-step sign-in is a password session and shows Change Password and Two-step | `#1432`, `lib/auth/password-session.ts` |
+| `0012` the authenticator entry is named after this webmail | a branded `APP_NAME` is the TOTP issuer | `#1160`, `lib/totp-issuer.ts` |
+| `0013` a send on a phone returns to the list | every send path returns a phone to the list | 1.14; `e2e-mobile-send.sh` kept as the check |
+| `0014` a password change asks for the next code | upstream signs a token session out after a password change instead; the next sign-in takes a fresh code, which Stalwart's one-time codes need | `#1432`. MainThrive chose upstream's behaviour (MAI-1442) |
 
 ## The problem
 
@@ -32,284 +61,125 @@ guarded fetch path), are unchanged. Unset, the image behaves exactly like upstre
 must trust `X-Forwarded-For` from this app (Stalwart: `useXForwarded`) and be reachable only by peers
 that cannot forge it.
 
-## Push previews after the session expires
 
-[`patches/0003-push-preview-renews-expired-session.patch`](patches/0003-push-preview-renews-expired-session.patch).
-When a push arrives, the service worker asks `/api/push/preview` for the new message's sender and
-subject. That route calls the JMAP server with the credential saved in the session. For a password or
-OAuth sign-in the credential is an OAuth access token, and only the **open app** renews it. Stalwart's
-tokens last an hour, so an hour after the app was last open every notification reads
-"You have new mail": the preview gets a 401 and the worker falls back to generic text.
+⚠️ Since 1.16 upstream also sets `X-Forwarded-For` on its sign-in, preview and DAV calls (`lib/auth/client-address.ts`).
+0001 replaces whatever a caller set, so the value is still the one it derives, and there is never a second. Upstream
+sends nothing for a loopback or unknown address, so the mail server would count that against this pod's own address;
+0001 sends `192.0.2.1` there. Stalwart 1.0 reads the header only with `Http.clientIpSource = xForwardedFor` and
+`forwardedHops = 1`, and answers 400 to a loopback address, which 0001 never sends.
 
-With the patch, when that credential is a `Bearer` token and the JMAP server answers 401, the route
-spends the session's refresh token (the exchange `PUT /api/auth/token` already makes for the app, now
-one shared function in `lib/oauth/refresh-slot.ts`), retries, and stores the new token and session
-only once the retry has worked. Three rules keep it safe:
+## The push relay (`0002`)
 
-- Two previews for one delivery share **one** refresh, keyed by the refresh token.
-- A failed refresh here **deletes nothing**. The preview answers 401 as before, and the app's own
-  renewal decides what the failure means.
-- A `Basic` credential never triggers a refresh.
+[`patches/0002-push-relay-build-arg.patch`](patches/0002-push-relay-build-arg.patch). Upstream reads
+`NEXT_PUBLIC_PUSH_RELAY_URL` at build time (`lib/push-relays.ts`), but its Dockerfile never passes it, so an image
+always offers the hosted relay. The patch adds the build argument, and this build sets it to our relay. Since 1.20 the
+hosted relay's host name also sits in upstream's lists of outside hosts, which name it and never call it, so
+`scripts/e2e.sh` checks that no built file holds the hosted relay's URL.
 
-## The notification badge
+## The notification badge (`0004`)
 
-[`patches/0004-notification-badge.patch`](patches/0004-notification-badge.patch). A notification
-carries two images: the icon, and the badge Android shows in the status bar. Bulwark used the PWA
-icon for both. Android draws the badge from its alpha channel alone, so an icon with an opaque
-background (which a maskable icon must have, and the manifest offers the PWA icon as maskable) shows
-as a solid square. `PWA_BADGE_URL` names a separate image, a transparent silhouette; the service
-worker asks for `/api/pwa-icon/192?purpose=badge`, which serves it, and falls back to the PWA icon
-when it is unset. [`scripts/e2e-badge.sh`](scripts/e2e-badge.sh) checks the built image: with it set
-the badge is its own image and the icon is unchanged, the shipped service worker asks for the badge
-URL, and without it the badge is the icon. Against `clientip.4` it fails.
+[`patches/0004-notification-badge.patch`](patches/0004-notification-badge.patch). A notification carries two images:
+the icon, and the badge Android shows in the status bar. Bulwark uses the PWA icon for both. Android draws the badge
+from its alpha channel alone, so an icon with an opaque background (which a maskable icon must have) shows as a solid
+square. `PWA_BADGE_URL` names a separate image, a transparent silhouette; the service worker asks for
+`/api/pwa-icon/192?purpose=badge`, which serves it, and falls back to the PWA icon when it is unset. 1.21's service
+worker shows four kinds of notification (new mail, its fallback, the silent re-show Safari needs, and the mailto focus),
+and all four ask for the badge. [`scripts/e2e-badge.sh`](scripts/e2e-badge.sh) checks the built image: with it set the
+badge is its own image and the icon is unchanged, the shipped service worker names the badge URL four times and the
+plain icon never, and without it the badge is the icon.
 
-## Why a preview failed
+## Why a preview failed (`0005`)
 
-[`patches/0005-push-preview-says-why.patch`](patches/0005-push-preview-says-why.patch). The preview
-route answered 401 on several paths without a word, so a generic notification could not be traced:
-no session context at all, an expired token with no refresh token, a renewed token the server then
-refused, a session that would not open, a probe that threw. Each now logs one warning with the slot
-and reason, never a value; the no-session one lists the NAMES of the cookies that arrived.
+[`patches/0005-push-preview-says-why.patch`](patches/0005-push-preview-says-why.patch). The preview answers 401, and
+the phone shows "You have new mail", on paths that log nothing: no session for the account the push names, no session
+context at all, and a session the mail server would not open. Each now logs one warning, never a value: the slot and
+status, or the names of the cookies that came. Upstream already logs a failed renewal.
 
-## Remembered sign-ins
+## Two-step sign-ins after a restart (`0007`)
 
-[`patches/0006-push-preview-restores-remembered-session.patch`](patches/0006-push-preview-restores-remembered-session.patch).
-0005's first real warning named the cause: `push preview found no session context`, with only
-`jmap_session` among the cookies. A "remember me" sign-in is Basic: its credentials sit in that 30-day
-cookie, and the context the server routes read is a browser-session cookie. When a push wakes a phone
-and its browser comes back from being killed in the background, the session cookie is gone and the
-remembered one is not, so the preview answered 401 and the notification was generic. Opening the app
-fixed it for a while because the app's own restore (`GET /api/auth/session`) rebuilds the context.
-The preview now does the same, through one helper both routes use
-(`restoreStalwartAuthContextFromSession`). Nothing new persists: it reads a cookie that already does.
-The renewal e2e's last step signs in with "remember me", drops the context cookie, and needs the
-preview to answer 200 and store a fresh context; against `clientip.6` it fails there.
+[`patches/0007-push-preview-restores-oauth-session.patch`](patches/0007-push-preview-restores-oauth-session.patch). A
+password plus two-step sign-in runs on tokens. When a push wakes a phone whose browser was killed in the background,
+its refresh token, sign-in stamp and server cookie are still there (they persist), but the context cookie ended with
+the browser session, and upstream rebuilds only a remembered Basic sign-in, so the notification was generic. For one
+login at most (the one the push names, by the account its stamp records, or the only one there is), the preview now
+renews from the refresh token under the same rules upstream's own renewal applies (`renewPushAuthHeader`: the stamp,
+the maximum session length, limits only a page enforces, the issuing server), keeps the rotated tokens, opens the
+session, and only then writes the rebuilt context. It opens the session once more than a preview with a context would (to learn the account).
+`e2e-preview-renewal.sh` step 7 keeps only the cookies a browser keeps across a restart and needs a 200. Its
+`no-0007` mode needs that step, and only that step, to fail against an image built without 0007; the build runs the
+`renews` mode only (a second image would double its time), and the control was run by hand when 0007 was re-ported
+(MainThrive MAI-1442, on the dev VM): it failed at step 7 alone, as it should. Run it again whenever 0007 changes.
+When a still-valid access token is cached (it persists like the refresh token), 0007 uses it as upstream's renewal
+does, and spends the refresh token only when it has expired.
 
-## OAuth sign-ins after a restart
-
-[`patches/0007-push-preview-restores-oauth-session.patch`](patches/0007-push-preview-restores-oauth-session.patch).
-The same restart leaves an OAuth sign-in (what an account with TOTP gets) with only its 30-day refresh
-token: no context, no cached access token, no remembered sign-in. The preview now renews from the
-refresh token (0003's exchange), opens the session with the new token, and only then stores the new
-token and a rebuilt context (server from the refresh token's own server entry, username from the JMAP
-session). The e2e keeps only the refresh-token cookie and needs a 200 preview; against `clientip.7` it
-fails there.
-
-## No stability banner on the Files page
-
-[`patches/0008-files-no-stability-banner.patch`](patches/0008-files-no-stability-banner.patch).
-Upstream's Files page always shows "Large file uploads can cause server instability…". The risk it
-describes is Stalwart on RocksDB (the admin text says so); MainThrive's Stalwart is PostgreSQL + R2,
-where a file's bytes go to R2 like a mail attachment's (measured: a 25 MiB file added 48 kB to
-Postgres). Stalwart bounds each upload (25 MiB per WebDAV request and per file) and each account (4
-requests at once, about 80 MiB of memory per 25 MiB upload in flight). Nothing yet bounds uploads
-server-wide, the same as for mail attachments; that is a scaling item with a measured budget, not
-something a banner can fix, so the banner goes. The workflow refuses a build whose Files page still
-renders it.
-
-## Files upload errors say why (`0009`, `clientip.10`)
-
-[`patches/0009-files-upload-errors-say-why.patch`](patches/0009-files-upload-errors-say-why.patch).
-The Files page uploads through JMAP (blob upload, then `FileNode/set`), and the client already throws
-the server's description; the page discarded it and showed "Failed to upload file" for everything.
-With MainThrive's Stalwart (stalwart-r2-patch 0004) a refused file now reads, for example, "Failed to
-upload file: The file contains malware.", "...: The file could not be scanned for malware; try again
-later." or "...: The file is larger than the 25 MB limit." No new translation key: the reason is the
-server's, appended to the existing message. The workflow refuses a build where either upload handler
-drops it.
-
-## Sign-ins survive an outage (`0010`, `clientip.11`)
-
-[`patches/0010-restore-keeps-session-through-outage.patch`](patches/0010-restore-keeps-session-through-outage.patch).
-On a page load the app restores each remembered account, and any error it did not recognise as an
-outage removed the account and deleted its remembered sign-in: the user saw "session expired" and had
-to type the password again. It recognised a network failure and a 5xx, but not the two errors a
-server outage behind a load balancer also produces: a request that timed out (30 s), and a fetch that
-failed while a second probe got through, which the client reports as `CORS_ERROR`. MainThrive's
-node-loss drill (2026-10-04) signed a user out exactly this way during a refresh. Both now keep the
-account, marked "Server unreachable", and it reconnects when the server answers. A real rejection
-(401) still signs out. The cost: a PERMANENT CORS misconfiguration now also keeps the session, so the
-user sees a stuck "Server unreachable" state instead of the sign-in screen (which never fixed it
-either). No credential is exposed by that: the remembered sign-in stays in its cookie as before. `stores/__tests__/auth-store-restore-outage.test.ts`
-fails on unpatched 1.11.2 for exactly the two new cases and passes its three controls (a network
-failure, a 502, a real rejection).
-
-## Two-step sign-ins keep their account security (`0011`, `clientip.12`)
-
-[`patches/0011-token-session-keeps-account-security.patch`](patches/0011-token-session-keeps-account-security.patch).
-A sign-in with a two-step code goes through Stalwart's token login, so the session is a token
-(`authMode: 'oauth'`) session. Upstream's Settings → Security showed such a session no Change Password,
-no Display Name and no Two-Factor Authentication: a user who turned two-step on could no longer change
-their password or turn two-step off. Instead it showed Email Client Setup (a "JMAP Username" for JMAP
-clients) and Link Mobile App (a QR code for upstream's own mobile app), neither of which MainThrive
-offers. Measured on a throwaway of MainThrive's Stalwart (v0.16.25 build) with a bearer token minted the
-way `totp-token-exchange` mints one: the display name, a password change (with the current code, which
-the form already sends) and turning two-step off and on again all succeed.
-
-The patch shows the three sections to every session, and no longer shows the two others (their
-components stay in the source, unrendered, to keep the patch small).
-
-A password change needs one more thing in a token session: Stalwart revokes the session's access **and**
-refresh tokens when the password changes. `keepTokenSessionThrough` runs the change, then signs in again
-through `totp-token-exchange` with the new password and the code the change was confirmed with (Stalwart
-accepted that code a second time within its window, measured), as `updateBasicPassword` already does for a
-password session. From before the change is sent until that sign-in lands, it holds the account's token
-refresh: a request that meets the revoked token in between (a push reconnect, a poll) waits for the new
-token, where a refresh would have spent the revoked refresh token, been refused, and signed the user out
-at once. If the new sign-in is refused, the session ends there as an expired one, and the user signs in
-again with the new password. A sign-out during it is respected, as in `refreshAccessToken`.
-
-`stores/__tests__/auth-store-token-password.test.ts` (the sign-in, the held refresh, a refused sign-in, a
-refused change, a password session), `components/settings/__tests__/account-security-token-session.test.tsx`
-(both session kinds render and load the sections) and one new assertion in
-`stores/__tests__/account-security-store.test.ts`. On unpatched 1.11.2 the token-session cases fail.
-
-**Known limits, accepted at review.**
-- **Code reuse.** ~~The re-sign-in reuses the confirming code.~~ Superseded by `0014`, below: MainThrive's
-  Stalwart now refuses a code a second time, so the re-sign-in asks for the next one.
-- **The push preview.** Its server-side token renewal (`/api/push/preview`) cannot see the client's hold. A
-  preview that renewed the session in the same second as the change can put the revoked tokens back in the
-  slot, and the next refresh then ends the session as expired.
-- **The global single-flight.** During the hold it can hand the new token to a non-active account's client,
-  as upstream's own single-flight already can.
-- **A failed response.** A change whose response fails on the network after the server applied it is treated
-  as refused, and the session ends at the next refresh.
-
-## The authenticator entry is named after this webmail (`0012`, `clientip.13`)
-
-[`patches/0012-totp-issuer-is-app-name.patch`](patches/0012-totp-issuer-is-app-name.patch).
-Settings → Security builds the two-step enrolment's `otpauth://` URL in the browser, and upstream hardcodes its
-issuer as `'Stalwart'`. An authenticator app names the entry after the issuer, so every user who turned two-step
-on found an entry called "Stalwart" (MainThrive MAI-936, MAI-947). Stalwart takes the URL as given, so no server
-setting can change it.
-
-The patch passes the deployment's own name, `appName` from `/api/config` (the `APP_NAME` variable; MainThrive sets
-"MainThrive Mail"), and falls back to upstream's default app name, "Webmail", if the config has not loaded. An
-entry already enrolled keeps its old name until the user renames it or enrols again: the issuer is only in the URL.
-
-`components/settings/__tests__/account-security-totp-issuer.test.tsx` turns two-step on in the rendered page and
-decodes the URL it shows, as an authenticator app reads it. With the hardcoded issuer put back, all three cases
-fail.
-
-## A send on a phone returns to the list (`0013`, `clientip.14`)
-
-[`patches/0013-mobile-send-returns-to-list.patch`](patches/0013-mobile-send-returns-to-list.patch).
-On a phone the list, the reading pane and the composer are separate screens, and opening the composer switches to the
-reading pane's screen. After a send, upstream closed the composer and left that screen up. For a new message composed
-from the list there is nothing on it to read, so the user landed on its empty state, "No conversation selected",
-instead of the folder they came from (MainThrive MAI-1010, reported from the installed PWA). Upstream 1.11.2 does this
-with none of these patches applied. Upstream already returned to the list after sending a draft that was open on that
-screen; nothing else did.
-
-After a send, and after scheduling one, a phone with no message or conversation open goes back to the list. A reply
-sent from an open message still returns to that message.
-
-[`scripts/e2e-mobile-send.sh`](scripts/e2e-mobile-send.sh) runs the built image in demo mode (`DEMO_MODE=true`,
-fixture data, no mail server) and drives it in a 390 × 844 touch browser: sign in to the demo, compose and send from
-the inbox, and the list must be on screen; open a message, reply and send, and the message must still be on screen.
-Against upstream 1.11.2 the first half fails. The scheduled-send path shares the fix but is not exercised by the e2e.
-
-## A password change asks for the next code (`0014`, `clientip.15`)
-
-[`patches/0014-password-change-asks-for-the-next-code.patch`](patches/0014-password-change-asks-for-the-next-code.patch).
-`0011` kept a two-step session signed in through a password change by signing in again with the new password and the
-code the change was confirmed with. MainThrive's Stalwart now accepts a code once (stalwart-r2-patch `0012`, MainThrive
-MAI-997, RFC 6238 § 5.2), so that sign-in is refused and the session would end. So once the change is applied, the form
-asks for the next code ("Password changed. Stay signed in?"): the user waits for the authenticator to show a new code,
-up to 30 seconds, and types it (the button waits for six digits). A refused code (the same one again, or a typo) is
-asked for again, saying why, up to three codes, after which the session ends as an expired one, as before `0011`.
-"Sign out", or leaving the page while it asks, signs out (not reported as expired). If the user signs out or switches
-account while it asks, nothing more happens to that session. Token refreshes
-stay held while it asks, so a request in the meantime waits rather than spending the revoked token. A session without
-two-step signs in again with the new password alone, as before.
-
-`stores/__tests__/auth-store-token-password.test.ts` (the next code asked for after the change, a refused code asked
-for again with a request waiting through it, at most three codes, declining, an account switch while it asks,
-another failure, no two-step),
-`components/settings/__tests__/account-security-next-code.test.tsx` (the prompt shows after the change, passes on a
-six-digit code only, says when one was refused, and passes on nothing when declined, left, or the account changes) and one changed assertion in
-`stores/__tests__/account-security-store.test.ts`. With `0014` reverted, the cases that ask for a code fail.
-
-## The Install card on an iPhone (`0015`, `clientip.16`)
+## The Install card on an iPhone (`0015`)
 
 [`patches/0015-ios-safari-install-steps.patch`](patches/0015-ios-safari-install-steps.patch). The Install card appears
-when the browser fires `beforeinstallprompt`, and Safari on an iPhone or iPad never does: iOS has no install prompt a
-page can call, so the card never appeared where most of MainThrive's users would install the app. iOS 26 does make every
-site added to the Home Screen open as a web app, so the steps are all that is missing. In iOS Safari, and only while the
-page is not already open from the Home Screen (`display-mode: standalone`, or `navigator.standalone`), the card now
-shows them instead of an Install button, once the user has signed in (on the sign-in page it sat over the sign-in
-button, which the e2e caught, so it also goes on sign-out):
+when the browser fires `beforeinstallprompt`, and Safari on an iPhone or iPad never does. In iOS Safari, and only while
+the page is not already open from the Home Screen, the card shows the steps instead of an Install button, once the user
+has signed in: Share (from ⋯ on an iPhone, at the top on an iPad), Add to Home Screen, then Add, leaving Open as Web App
+on where Safari shows it. The first step's arrow bounces toward Safari's toolbar. It follows upstream's own rules for
+the card: "Not now" holds it back for a week, an organisation that turned the install prompt off gets none,
+and it stays out of the way while a message is being written. Don't remind me again is a button like Not now
+(MainThrive MAI-1181). `components/__tests__/pwa-install-prompt-ios.test.tsx` fails on every case against upstream's
+component; [`scripts/e2e-ios-install.sh`](scripts/e2e-ios-install.sh) checks the built image in WebKit as an iPhone and
+Chrome as an Android phone.
 
-1. ⋯ beside the address bar, then Share (an iPad's Share is at the top);
-2. Add to Home Screen;
-3. Add, leaving Open as Web App on where Safari shows it (iOS 26; iOS 18 has no such switch, so from `clientip.18`
-   the step says to leave it on only if it is there).
+## Upstream's shared store on PostgreSQL (`0016`)
 
-The first step's icon is an arrow bouncing toward Safari's toolbar: down on an iPhone, where the card sits just above
-webmail's own tab bar so it never covers it, and up on an iPad, where the card is at the top right. Not now
-and Don't remind me again work as before, and from `clientip.17` Don't remind me again is styled exactly as Not now is:
-upstream's faint text looked disabled on Bill's iPhone. An iPad that asks for the desktop site is told apart from a Mac by its touch
-screen. Chrome, Firefox, Edge and Opera on iOS name themselves in the user agent, and get nothing, since their steps differ.
-`components/__tests__/pwa-install-prompt-ios.test.tsx` covers which devices count, the iPhone and iPad layouts, and the
-cases that show nothing, including before sign-in; with the Home Screen check or the sign-in check removed, its case fails. [`scripts/e2e-ios-install.sh`](scripts/e2e-ios-install.sh) checks the built
-image in demo mode: WebKit as an iPhone gets the three steps and no Install button, and Chrome as an Android phone does
-not get them. `OUT=<dir>` saves the iPhone's screenshot for review (MainThrive MAI-1181).
+[`patches/0016-shared-store-postgres.patch`](patches/0016-shared-store-postgres.patch). Since 1.20 upstream keeps every
+piece of server state that several instances must agree on behind one interface (`lib/shared-store`, `#1066`): synced
+settings, pairing and mobile hand-off codes, the device-wipe registry, the stale-credential refusal budget, login
+limits, the scheduler lease. Its backends are local files and memory, or one Redis URL. The patch adds a third,
+`lib/shared-store/postgres.ts`, selected by `SHARED_STORE=postgres` and connecting with the standard `PG*` variables;
+nothing upstream calls changes.
 
-## Two or more instances share settings and pairing codes (`0016`, `clientip.19`)
-
-[`patches/0016-shared-store-postgres.patch`](patches/0016-shared-store-postgres.patch). Upstream targets one instance:
-each user's synced settings are a file (`data/settings/<sha256>.enc`), and the QR device-pairing codes are an in-process
-`Map` (`lib/auth/pairing-store.ts` says a multi-instance deployment would need a shared store). Behind a load balancer two
-instances disagree on both: a setting saved on one is missing on the other, and about half the redeems of a pairing code
-land on the instance that never minted it. Sessions need nothing: they are AES-GCM cookies under the shared
-`SESSION_SECRET`.
-
-With `SHARED_STORE=postgres`, `lib/server/shared-store.ts` keeps both in PostgreSQL, connecting with the standard `PG*`
-variables:
-
-| Table | Holds |
+| Table (`bulwark_store_…`) | Holds |
 |---|---|
-| `bulwark_settings` | the same encrypted blob the file held, under the file's name as its key. Nothing is decrypted or re-encrypted, so a legacy file can be copied in as-is |
-| `bulwark_pairing` | each code's SHA-256 (never the code), the tokens encrypted under `SESSION_SECRET` (purpose `pairing`), and an expiry by the database's clock. One `DELETE … RETURNING` redeems it, so a code is single-use across every instance |
+| `kv` | short-lived values, with an expiry by the database's clock |
+| `counters` | fixed-window limits, by the caller's clock, as upstream's limiters count |
+| `docs` | durable documents (settings among them), with a version that changes on every write |
+| `logs` | append-only logs, one writer's lines in order and a batch never split |
+| `leases`, `epochs`, `replicas` | coordination: who runs the background jobs, which area changed, which instances are alive |
 
-The tables are created at start, under an advisory lock so two instances starting together cannot race. TLS is verified:
-against `PGSSLROOTCERT` when set (a private CA, such as CloudNativePG's), else the system's CAs; `PGSSLMODE=disable`
-turns it off, for tests. ⛔ **It fails closed**: with the store on and the database unreachable, a settings save or load
-answers 500 (the browser keeps its own copy, as upstream's client already does on an error) and a pairing fails; it
-never falls back to the file or the `Map`, where the instances would disagree. Each instance logs
-`Shared store: ready (postgres)` at start, or `Shared store: FAILED …` with the reason. The only dependency added is
-`pg` (8.23.1, with `@types/pg`). Unset, nothing changes.
+Every check-then-write is one statement or one transaction, as each is one Lua script for Redis. TLS is verified:
+against `PGSSLROOTCERT` when set (CloudNativePG's CA), else the system's CAs; `PGSSLMODE=disable` is for tests. ⛔ **It
+fails closed**: an unreachable database is upstream's `StoreUnavailableError`, never a fallback to local files, and an
+instance that cannot reach it at start waits, logging `Waiting for the shared store`, and is not ready (`/api/ready`
+503) until it can. Each instance logs `Using a shared store` with `postgres://<user>@<host>/<db>` and `Shared store ready`.
+The only dependency added is `pg` (8.23.1, with `@types/pg`).
 
-`lib/__tests__/shared-store.test.ts` runs two instances (two module graphs) over one database: settings and codes cross
-between them, a code redeems once, an expired one is refused, the row holds no plaintext, and with the database down
-every call fails and no file is written. [`scripts/e2e-shared-store.sh`](scripts/e2e-shared-store.sh) runs two
-instances of the built image with a real Stalwart and a real PostgreSQL over TLS with a private CA: a save on each
-instance is what the other loads, a code minted on one redeems on the other (and its access token opens a JMAP session)
-and never again on either, and an instance trusting another CA logs `FAILED` and answers 500 rather than serving local
-settings. Its `separate` mode, the same two instances with the store off, is the negative control: each keeps its own
-(MainThrive MAI-1406).
+⭐ **On its first start it carries over what the earlier 0016 kept.** That patch stored each settings blob in
+`bulwark_settings`, under the same id upstream's settings use (`sha256` of `user:server`) and in the same bytes. The new
+store copies each row into a `settings` document, then renames the old table `bulwark_settings_before_1_21`, under the
+same advisory lock as the schema, so the copy runs once and the old rows stay as they were. The earlier pairing codes
+lived minutes and are not carried over.
+
+`lib/shared-store/__tests__/postgres-store.test.ts` runs upstream's own store contract (`contract.ts`, the one the
+Redis backend is held to, with three instances standing in for replicas) against a real PostgreSQL, plus the
+carry-over, and the build runs it; with any of the locks, the absent-only insert or the per-writer log order taken
+out, a contract case fails. [`scripts/e2e-shared-store.sh`](scripts/e2e-shared-store.sh) runs the built image with a
+real Stalwart and a real PostgreSQL over TLS with a private CA. `shared`: a save on each instance is what the other
+loads, a pairing code minted on one redeems on the other once, an instance trusting another CA stays out of service
+and answers 503, and neither the code nor the token is in the store in clear. `separate`, the store off, is the
+negative control. `upgrade`: the image production ran before (`1.11.2-clientip.19`) saves a user's settings; both
+instances of this one then load them, the document is the old row byte for byte, and the old table is kept
+(MainThrive MAI-1406, MAI-1442).
+
+## No "Link mobile app" (`0017`)
+
+[`patches/0017-no-link-mobile-app.patch`](patches/0017-no-link-mobile-app.patch). Settings > Security offers a QR code
+that pairs Bulwark's own phone app. MainThrive neither documents nor supports that app, so the card is not shown, on
+either layout of the page. Mail apps are set up from upstream's Email client setup card, which stays. Upstream's
+`link-device-section.test.tsx` cases that rendered the card now check it is absent (MainThrive MAI-1442).
 
 ## Verified
 
-The workflow fails unless the patch changes exactly its three files; it runs the patch's 15 unit
-tests and the typecheck; and it runs [`scripts/e2e.sh`](scripts/e2e.sh) against the **built image**
-(a stub stands in for the JMAP server): the pre-check must reach the internal URL carrying the
-visitor's IP, and the same image without the variables must not reach it at all. Only then is the
-image pushed.
-
-For 0003, the workflow also runs the preview and token routes' suites, and
-[`scripts/e2e-preview-renewal.sh`](scripts/e2e-preview-renewal.sh): a real Stalwart with 20-second
-access tokens and the built image. A real password sign-in and the app's session sync, then previews:
-across an expiry (two at once), across a second expiry with the cookies the first renewal stored, and
-without a refresh token (401, and no cookie changed). The script's negative control (`401`) run
-against the image before this patch (`clientip.3`) reproduces the failure: 200 while the token is
-fresh, 401 after.
-
-Upstream's full suite passes with the patches applied except tests that fail on unpatched 1.11.2
-too: `health-route` and `idn` when 0001 was measured, and `health-route` and `birthday-calendar` (on a
-Node 22 host) when 0003 was, and the same two when 0011 was (4862 passed; both fail identically with
-0011 reverted). When 0016 was measured (Node 22 host): 4877 passed, and the 26 failures are all
-`translations.test.ts`, every locale missing the English-only keys 0014 and 0015 add; 0016 adds no locale key.
+The workflow fails unless the patches change exactly their files and each patch's own line is in place; it runs the
+patches' tests and the suites they touch, upstream's store contract against a real PostgreSQL, and the typecheck; then
+it builds the image and runs every end-to-end check above against it, [`scripts/e2e.sh`](scripts/e2e.sh) first (a stub
+stands in for the JMAP server: the pre-check reaches the internal URL with the visitor's IP, or `192.0.2.1`, and the
+same image without the variables does not reach it). Only then is the image pushed.
 
 Image: `ghcr.io/bill-scheffer/bulwark-client-ip:<bulwark tag>-clientip.N`. Pin it by digest.
 
@@ -318,7 +188,7 @@ Image: `ghcr.io/bill-scheffer/bulwark-client-ip:<bulwark tag>-clientip.N`. Pin i
 | What runs `build` | Checks | Pushes |
 |---|---|---|
 | A pull request to `main` | every check: patches, assertions, tests, the image build, every end-to-end check | **nothing**, and it never logs in to the registry |
-| A push to `main`, or a dispatch on `main` | the same | the **release tag**: `<VERSION>`, e.g. `1.11.2-clientip.13` |
+| A push to `main`, or a dispatch on `main` | the same | the **release tag**: `<VERSION>`, e.g. `1.21.2-clientip.20` |
 | A dispatch from any other branch | the same | **`branch-<short sha>`** only, never the release tag |
 
 `build` is the required check on `main`, so a pull request merges only once it is green.
@@ -344,12 +214,13 @@ A digest pinned without a tag of its own, such as one pinned before that, is pro
 gh workflow run protect-digest.yml -R Bill-Scheffer/bulwark-client-ip -f digest=sha256:<64 hex>
 ```
 
+
 ## When this goes away
 
-When upstream ships an equivalent, use the upstream image again and archive this repository. The
-change is offered upstream.
+Each patch goes when upstream ships an equivalent: check upstream main before carrying one to a new release, as the
+table at the top records. When none is left, use the upstream image again and archive this repository.
 
 ## Licence
 
-Bulwark is licensed under the AGPL-3.0; this build is offered with its complete corresponding
-source: upstream's tagged release plus the patch above, which is the whole of this repository.
+Bulwark is licensed under the AGPL-3.0; this build is offered with its complete corresponding source: upstream's
+tagged release plus the patches above, which are the whole of this repository.

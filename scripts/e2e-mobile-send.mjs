@@ -1,6 +1,8 @@
-// End-to-end for 0013, in a phone-sized browser against the built image in demo mode: a new message
+// End-to-end, in a phone-sized browser against the built image in demo mode: a new message
 // sent from the list lands back on the list, not on the empty reading pane; a reply sent from an
 // open message still lands on that message.
+// Patch 0013 did this until upstream did it itself (1.14; MainThrive MAI-1442 retired 0013). Kept as the check that
+// upstream still does, since MainThrive asked for this behaviour (MAI-1010).
 // Usage: node e2e-mobile-send.mjs <bulwark url>
 import { chromium } from 'playwright-core';
 
@@ -34,13 +36,16 @@ await page.getByPlaceholder('Recipient email addresses').fill('someone@example.c
 await page.getByPlaceholder('Subject').fill('e2e mobile send');
 await page.locator('[contenteditable=true]:visible').first().fill('hello');
 await page.getByRole('button', { name: 'Send', exact: true }).click();
-await page.getByText('Email sent successfully').waitFor({ timeout: 30_000 });
+// 1.21 says "Sending…", then "Sent" (compose_send.sent); 1.11 said "Email sent successfully".
+await page.getByText('Sent', { exact: true }).waitFor({ timeout: 30_000 });
 if (!(await compose.waitFor({ timeout: 10_000 }).then(onList, () => false))) await fail(page, 'after a send the list is not on screen (the empty reading pane is)');
 console.log('on the list');
 
 console.log('== a reply, sent from an open message, lands on that message');
-const subject = 'Welcome to Bulwark Mail!';
-const reply = page.getByRole('button', { name: 'Reply (r)', exact: true });
+// A message in 1.21's demo inbox (lib/demo/fixtures/emails.ts).
+const subject = 'Coffee before the go/no-go?';
+// 1.11 named it "Reply (r)"; 1.21 "Reply", with the shortcut in its tooltip.
+const reply = page.getByRole('button', { name: /^Reply( \(r\))?$/ }).filter({ visible: true }).first();
 const backToList = page.getByRole('button', { name: 'Back to list', exact: true });
 await page.getByText(subject, { exact: true }).first().click();
 await reply.waitFor({ timeout: 30_000 });

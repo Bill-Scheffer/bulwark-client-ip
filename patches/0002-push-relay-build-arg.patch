@@ -1,8 +1,8 @@
 diff --git a/Dockerfile b/Dockerfile
-index b36abc8..451caba 100644
+index fd230e582..e2b5d8730 100644
 --- a/Dockerfile
 +++ b/Dockerfile
-@@ -17,6 +17,10 @@ ENV NEXT_PUBLIC_LOCALE_PREFIX=$NEXT_PUBLIC_LOCALE_PREFIX
+@@ -22,6 +22,10 @@ ENV NEXT_PUBLIC_LOCALE_PREFIX=$NEXT_PUBLIC_LOCALE_PREFIX
  # build time because next-intl wires it into client-side routing too.
  ARG NEXT_PUBLIC_DEFAULT_LOCALE=
  ENV NEXT_PUBLIC_DEFAULT_LOCALE=$NEXT_PUBLIC_DEFAULT_LOCALE

@@ -1,0 +1,83 @@
+diff --git a/components/settings/__tests__/link-device-section.test.tsx b/components/settings/__tests__/link-device-section.test.tsx
+index c9c64e7af..ffa807661 100644
+--- a/components/settings/__tests__/link-device-section.test.tsx
++++ b/components/settings/__tests__/link-device-section.test.tsx
+@@ -449,28 +449,30 @@ describe('LinkDeviceSection status polling', () => {
+   });
+ });
+ 
++// MainThrive MAI-1442: the Security page shows no Link mobile app card (patch 0017). Bulwark's own phone app is one
++// MainThrive neither documents nor supports; mail apps are set up from Email client setup, which stays.
+ describe('AccountSecuritySettings link-device visibility', () => {
+   beforeEach(() => {
+     useAuthStore.setState({ isAuthenticated: false, authMode: 'basic', client: null });
+   });
+ 
+-  it('shows the linker to password accounts on servers without account management', () => {
++  it('shows no linker to password accounts on servers without account management', () => {
+     useAccountSecurityStore.setState({ isStalwart: false, isProbing: false });
+     render(<AccountSecuritySettings />);
+-    expect(screen.getByText('link_device.title')).toBeInTheDocument();
++    expect(screen.queryByText('link_device.title')).toBeNull();
+     expect(screen.getByText('not_available')).toBeInTheDocument();
+   });
+ 
+-  it('shows the linker and the mail client setup to password accounts on Stalwart', () => {
++  it('shows the mail client setup and no linker to password accounts on Stalwart', () => {
+     // The client setup used to be OAuth-only; password users ask for it just as often.
+     useAccountSecurityStore.setState({ isStalwart: true, isProbing: false });
+     render(<AccountSecuritySettings />);
+-    expect(screen.getByText('link_device.title')).toBeInTheDocument();
++    expect(screen.queryByText('link_device.title')).toBeNull();
+     expect(screen.getByText('email_client.title')).toBeInTheDocument();
+     expect(screen.getByText('password.title')).toBeInTheDocument();
+   });
+ 
+-  it('mounts the linker only once the server probe has a verdict', () => {
++  it('shows no linker before or after the server probe has a verdict', () => {
+     // A layout guessed before the verdict remounted the linker afterwards and
+     // threw away a QR that was already showing.
+     useAuthStore.setState({ isAuthenticated: true, authMode: 'oauth', client: null });
+@@ -481,7 +483,8 @@ describe('AccountSecuritySettings link-device visibility', () => {
+ 
+     act(() => useAccountSecurityStore.setState({ isStalwart: false }));
+     rerender(<AccountSecuritySettings />);
+-    expect(screen.getByText('link_device.title')).toBeInTheDocument();
++    expect(screen.queryByText('link_device.title')).toBeNull();
++    expect(screen.getByText('not_available')).toBeInTheDocument();
+   });
+ 
+   it('hides the linker in Bulwark Lite', () => {
+diff --git a/components/settings/account-security-settings.tsx b/components/settings/account-security-settings.tsx
+index 50c8f3fa1..2a9aa49d0 100644
+--- a/components/settings/account-security-settings.tsx
++++ b/components/settings/account-security-settings.tsx
+@@ -928,6 +928,10 @@ const PAIR_DEFAULT_EXPIRES_IN = 120;
+ // `reauth_required` until the user has just re-authenticated: accounts that
+ // signed in through the identity provider go back there (prompt=login),
+ // password accounts confirm their password (and TOTP code) right here.
++// MainThrive: no "Link mobile app" card. It pairs Bulwark's own phone app, which MainThrive neither documents nor
++// supports; mail apps are set up from the Email client setup card below it instead.
++const OFFER_MOBILE_APP = false;
++
+ export function LinkDeviceSection() {
+   const t = useTranslations('settings.security');
+   const params = useParams();
+@@ -1474,7 +1478,7 @@ export function AccountSecuritySettings() {
+       <SettingsSection id="devices" title={t('title')} description={t('description')}>
+         {!IS_LITE ? (
+           <div className="space-y-6">
+-            {!IS_DESKTOP_BUILD && (
++            {OFFER_MOBILE_APP && !IS_DESKTOP_BUILD && (
+               <>
+                 <LinkDeviceSection />
+                 <div className="border-t border-border" />
+@@ -1520,7 +1524,7 @@ export function AccountSecuritySettings() {
+         description={withoutPassword ? t('description') : t('sections.devices_description')}
+       >
+         <div className="space-y-6">
+-          {!IS_LITE && !IS_DESKTOP_BUILD && (
++          {OFFER_MOBILE_APP && !IS_LITE && !IS_DESKTOP_BUILD && (
+             <>
+               <LinkDeviceSection />
+               <div className="border-t border-border" />

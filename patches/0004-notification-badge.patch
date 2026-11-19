@@ -1,8 +1,8 @@
 diff --git a/.env.example b/.env.example
-index 14a59e6..7634bb1 100644
+index 6b2d450b7..0fca1af6f 100644
 --- a/.env.example
 +++ b/.env.example
-@@ -236,6 +236,9 @@ JMAP_SERVER_URL=https://your-jmap-server.com
+@@ -278,6 +278,9 @@ JMAP_SERVER_URL=https://your-jmap-server.com
  # Can be an absolute URL (https://...) or a path relative to the public/ directory.
  # Falls back to FAVICON_URL if not set, and to the default Bulwark icons if neither is set.
  # PWA_ICON_URL=/branding/my-icon.svg
@@ -13,10 +13,10 @@ index 14a59e6..7634bb1 100644
  # ---------------------------------------------------------------------------
  # PWA appearance
 diff --git a/app/api/pwa-icon/[size]/route.ts b/app/api/pwa-icon/[size]/route.ts
-index 9f99e1a..9b2b014 100644
+index 262f42cb2..1d41cfc8e 100644
 --- a/app/api/pwa-icon/[size]/route.ts
 +++ b/app/api/pwa-icon/[size]/route.ts
-@@ -32,7 +32,14 @@ export async function GET(
+@@ -35,7 +35,14 @@ export async function GET(
      parseDomainBranding(configManager.get<unknown>('domainBranding', [])),
    );
    const sources = configManager.getAllWithSources();
@@ -33,7 +33,7 @@ index 9f99e1a..9b2b014 100644
      (sources.pwaIconUrl?.source !== 'default' ? (sources.pwaIconUrl?.value as string) : '') ||
 diff --git a/lib/__tests__/pwa-icon-badge.test.ts b/lib/__tests__/pwa-icon-badge.test.ts
 new file mode 100644
-index 0000000..20e76b2
+index 000000000..20e76b218
 --- /dev/null
 +++ b/lib/__tests__/pwa-icon-badge.test.ts
 @@ -0,0 +1,64 @@
@@ -102,10 +102,10 @@ index 0000000..20e76b2
 +  });
 +});
 diff --git a/lib/admin/types.ts b/lib/admin/types.ts
-index bb4c952..d8a48d7 100644
+index bafe09361..3510bd059 100644
 --- a/lib/admin/types.ts
 +++ b/lib/admin/types.ts
-@@ -203,6 +203,10 @@ export const CONFIG_ENV_MAP: Record<string, { envVar: string; fileEnvVar?: strin
+@@ -286,6 +286,10 @@ export const CONFIG_ENV_MAP: Record<string, { envVar?: string; fileEnvVar?: stri
    devMode: { envVar: 'DEV_MOCK_JMAP', type: 'boolean', defaultValue: false },
    faviconUrl: { envVar: 'FAVICON_URL', type: 'url', defaultValue: '/branding/Bulwark_Favicon.svg' },
    pwaIconUrl: { envVar: 'PWA_ICON_URL', type: 'url', defaultValue: '' },
@@ -117,19 +117,37 @@ index bb4c952..d8a48d7 100644
    pwaScreenshotDesktopUrl: { envVar: 'PWA_SCREENSHOT_DESKTOP_URL', type: 'url', defaultValue: '' },
    pwaThemeColor: { envVar: 'PWA_THEME_COLOR', type: 'string', defaultValue: '#ffffff' },
 diff --git a/public/sw.js b/public/sw.js
-index 7d31d60..631924b 100644
+index 58475d792..5cb0d270b 100644
 --- a/public/sw.js
 +++ b/public/sw.js
-@@ -214,7 +214,7 @@ async function handlePush(event) {
+@@ -641,7 +641,7 @@ async function handlePush(event) {
+         body: "You have new mail",
+         tag: "bulwark-mail:" + (accountId || "default"),
+         icon: `${BASE_PATH}/api/pwa-icon/192`,
+-        badge: `${BASE_PATH}/api/pwa-icon/192`,
++        badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`,
+         data: { kind: "mail-list", accountId },
+       });
+     }
+@@ -821,7 +821,7 @@ async function notifyAccount(accountId, emailIds, accountLabel, lingering = [])
      // Branded app icon via the PWA-icon endpoint (admin-configured, else the
      // built-in default). The static /icon-192x192.png ignored admin branding.
      icon: `${BASE_PATH}/api/pwa-icon/192`,
 -    badge: `${BASE_PATH}/api/pwa-icon/192`,
 +    badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`,
      data,
-     renotify: true,
-   });
-@@ -389,7 +389,7 @@ async function showMailtoFocusNotification(state) {
+     // Inside the quiet window, or with the sound setting off, the
+     // notification still appears or updates, without a sound.
+@@ -866,7 +866,7 @@ const PREVIEW_LATE = Symbol("preview late");
+ async function showWithoutAlert(groupTag) {
+   const options = {
+     icon: `${BASE_PATH}/api/pwa-icon/192`,
+-    badge: `${BASE_PATH}/api/pwa-icon/192`,
++    badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`,
+     renotify: false,
+     silent: true,
+   };
+@@ -1401,7 +1401,7 @@ async function showMailtoFocusNotification(state) {
        body: state.focusNotificationBody || "The request was opened in Bulwark. Click to bring it to the front.",
        tag: "bulwark-mailto-focus",
        icon: `${BASE_PATH}/api/pwa-icon/192`,

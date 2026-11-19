@@ -38,12 +38,12 @@ echo "icon ${on[0]}  badge ${on[1]}"
 [ "${on[0]%%:*}" = 200 ] && [ "${on[1]%%:*}" = 200 ] || { echo "::error::the icon routes did not answer 200"; exit 1; }
 [ "${on[0]}" != "${on[1]}" ] || { echo "::error::the badge is the same image as the icon"; exit 1; }
 
-echo "== the shipped service worker asks for the badge URL, in both of its notifications"
+echo "== the shipped service worker asks for the badge URL, in all four of its notifications (mail, its fallback, the silent re-show, mailto focus)"
 sw=$(docker exec e2e-badge node -e 'fetch("http://127.0.0.1:3000/sw.js").then(r=>r.text()).then(t=>process.stdout.write(t))')
 n_badge=$(grep -cF 'badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`' <<<"$sw" || true)
 n_plain=$(grep -cF 'badge: `${BASE_PATH}/api/pwa-icon/192`,' <<<"$sw" || true)
 echo "badge lines naming ?purpose=badge: $n_badge; naming the plain icon: $n_plain"
-[ "$n_badge" = 2 ] && [ "$n_plain" = 0 ] || { echo "::error::the service worker does not ask for the badge URL"; exit 1; }
+[ "$n_badge" = 4 ] && [ "$n_plain" = 0 ] || { echo "::error::the service worker does not ask for the badge URL"; exit 1; }
 
 echo "== without PWA_BADGE_URL: the badge falls back to the icon"
 start e2e-badge-off

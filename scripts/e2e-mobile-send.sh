@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end for 0013 against the BUILT image, in demo mode (fixture data, no mail server): in a
+# End-to-end against the BUILT image (upstream since 1.14; patch 0013 before), in demo mode (fixture data, no mail server): in a
 # phone-sized browser, a new message sent from the list lands back on the list, not on the empty
 # reading pane, and a reply sent from an open message stays on that message. The client side is
 # e2e-mobile-send.mjs, run in Playwright's own image inside the webmail container's network, so the
