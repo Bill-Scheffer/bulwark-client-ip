@@ -41,7 +41,7 @@ index 92e9d437c..7109482b1 100644
    // Renewing writes a slot's rotated tokens into this answer. Every expired
    // login at once could outgrow a proxy's header buffer, and an answer lost
 diff --git a/lib/stalwart/push-token-renewal.ts b/lib/stalwart/push-token-renewal.ts
-index 95579ad62..e0cc636dc 100644
+index 95579ad62..3d3803143 100644
 --- a/lib/stalwart/push-token-renewal.ts
 +++ b/lib/stalwart/push-token-renewal.ts
 @@ -4,7 +4,8 @@ import { isPastMaxAge, maxSessionHoursFor, tokenSignedInAt } from '@/lib/auth/se
@@ -54,7 +54,7 @@ index 95579ad62..e0cc636dc 100644
  import { limitsOnlyAPageEnforces } from '@/lib/stalwart/push-auth-context';
  
  type CookieStore = Awaited<ReturnType<typeof cookies>>;
-@@ -77,3 +78,82 @@ export async function renewPushAuthHeader(
+@@ -77,3 +78,88 @@ export async function renewPushAuthHeader(
    );
    return `Bearer ${accessToken}`;
  }
@@ -69,9 +69,10 @@ index 95579ad62..e0cc636dc 100644
 + * every notification after such a restart read "You have new mail".
 + *
 + * The same rules as renewPushAuthHeader decide whether it may renew here, and
-+ * the same exchange renews. The rotated tokens are kept at once (the old refresh
-+ * token is spent), and the context only once the session opened with the new
-+ * token, which also names the account. Null, and a warning naming the reason
++ * the same exchange renews, unless the access-token cache still holds a token
++ * with life left, which is used as it is. The rotated tokens are kept at once
++ * (the old refresh token is spent), and the context only once the session
++ * opened with the token, which also names the account. Null, and a warning naming the reason
 + * (never a value), when it can't.
 + */
 +export async function restorePushContextFromRefreshToken(
@@ -104,20 +105,25 @@ index 95579ad62..e0cc636dc 100644
 +  } catch {
 +    return why('no server address for the token');
 +  }
-+  const redemption = await redeemRefreshToken(refreshToken, bound.serverId, bound.upstream);
-+  if (redemption.kind !== 'issued' || !redemption.tokens.access_token) {
-+    return why('renewal failed', {
-+      ...(redemption.kind === 'refused' ? { status: redemption.status } : {}),
-+      ...(redemption.kind === 'unreachable' ? { error: redemption.message } : {}),
-+    });
++  // An access token the cache still holds (it persists like the refresh token) is used as it is, as
++  // renewPushAuthHeader does: spending the refresh token for it would rotate it for nothing.
++  let accessToken = decodeCachedAccessToken(cookieStore.get(accessTokenCookieName(slot))?.value)?.accessToken;
++  if (!accessToken) {
++    const redemption = await redeemRefreshToken(refreshToken, bound.serverId, bound.upstream);
++    if (redemption.kind !== 'issued' || !redemption.tokens.access_token) {
++      return why('renewal failed', {
++        ...(redemption.kind === 'refused' ? { status: redemption.status } : {}),
++        ...(redemption.kind === 'unreachable' ? { error: redemption.message } : {}),
++      });
++    }
++    if (wasSignedOut(refreshToken)) return null;
++    ({ accessToken } = storeRenewedTokens(
++      cookieStore,
++      slot,
++      { ...redemption.tokens, access_token: redemption.tokens.access_token },
++      { remember, age, basePath, server: bound },
++    ));
 +  }
-+  if (wasSignedOut(refreshToken)) return null;
-+  const { accessToken } = storeRenewedTokens(
-+    cookieStore,
-+    slot,
-+    { ...redemption.tokens, access_token: redemption.tokens.access_token },
-+    { remember, age, basePath, server: bound },
-+  );
 +  const authHeader = `Bearer ${accessToken}`;
 +  const res = await openSession(serverUrl, authHeader);
 +  if (!res.ok) return why('the renewed token could not open the session', { status: res.status });

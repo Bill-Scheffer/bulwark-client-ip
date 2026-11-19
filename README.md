@@ -104,9 +104,13 @@ the browser session, and upstream rebuilds only a remembered Basic sign-in, so t
 login at most (the one the push names, by the account its stamp records, or the only one there is), the preview now
 renews from the refresh token under the same rules upstream's own renewal applies (`renewPushAuthHeader`: the stamp,
 the maximum session length, limits only a page enforces, the issuing server), keeps the rotated tokens, opens the
-session, and only then writes the rebuilt context. It sends nothing to the mail server that upstream's renewal does not.
-`e2e-preview-renewal.sh` step 7 keeps only the cookies a browser keeps across a restart and needs a 200; its
-`no-0007` mode runs the same image without 0007 and needs that step, and only that step, to fail.
+session, and only then writes the rebuilt context. It opens the session once more than a preview with a context would (to learn the account).
+`e2e-preview-renewal.sh` step 7 keeps only the cookies a browser keeps across a restart and needs a 200. Its
+`no-0007` mode needs that step, and only that step, to fail against an image built without 0007; the build runs the
+`renews` mode only (a second image would double its time), and the control was run by hand when 0007 was re-ported
+(MainThrive MAI-1442, on the dev VM): it failed at step 7 alone, as it should. Run it again whenever 0007 changes.
+When a still-valid access token is cached (it persists like the refresh token), 0007 uses it as upstream's renewal
+does, and spends the refresh token only when it has expired.
 
 ## The Install card on an iPhone (`0015`)
 

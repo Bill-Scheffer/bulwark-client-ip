@@ -152,6 +152,8 @@ jobs:
             '?? lib/__tests__/pwa-icon-badge.test.ts' '?? lib/server/' '?? lib/shared-store/__tests__/postgres-store.test.ts' \
             '?? lib/shared-store/postgres.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
+          # The one new directory holds exactly 0001's file (git status names the directory, not its contents).
+          [ "$(ls -A lib/server)" = jmap-upstream-fetch.ts ] || { echo "::error::lib/server holds more than 0001's file: $(ls -A lib/server)"; exit 1; }
           # 0004: every notification the service worker shows asks for the badge, none for the plain icon.
           [ "$(grep -cF 'badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`' public/sw.js)" = 4 ] \
             && ! grep -nF 'badge: `${BASE_PATH}/api/pwa-icon/192`,' public/sw.js \
@@ -159,6 +161,7 @@ jobs:
           # 0005: the preview's silent 401s say why.
           grep -qF "logger.warn('push preview could not open the session'" app/api/push/preview/route.ts \
             && grep -qF "logger.warn('push preview found no session for the account'" app/api/push/preview/route.ts \
+            && grep -qF "logger.warn('push preview found no session context'" app/api/push/preview/route.ts \
             || { echo "::error::the push preview still answers 401 without a word"; exit 1; }
           # 0007: a token sign-in that kept only its refresh token is rebuilt for the preview.
           grep -qF 'await restorePushContextFromRefreshToken(cookieStore, restoreSlot, basePath' app/api/push/preview/route.ts \

@@ -23,10 +23,10 @@ index 0fca1af6f..4121a7e3d 100644
  # /app/data/settings - mount a persistent volume there (see docker-compose.yml).
 diff --git a/lib/shared-store/__tests__/postgres-store.test.ts b/lib/shared-store/__tests__/postgres-store.test.ts
 new file mode 100644
-index 000000000..9fc3bfc56
+index 000000000..e9cfee228
 --- /dev/null
 +++ b/lib/shared-store/__tests__/postgres-store.test.ts
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,155 @@
 +import { randomBytes } from 'node:crypto';
 +import { Client } from 'pg';
 +import { afterAll, describe, expect, it } from 'vitest';
@@ -69,6 +69,11 @@ index 000000000..9fc3bfc56
 +    ['too many clients', Object.assign(new Error('sorry, too many clients already'), { code: '53300' })],
 +    ['a lost connection', new Error('Connection terminated unexpectedly')],
 +    ['a query that timed out', new Error('Query read timeout')],
++    ['a broken pipe', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })],
++    ['a refused password (a rotation)', Object.assign(new Error('password authentication failed'), { code: '28P01' })],
++    ['a missing database', Object.assign(new Error('database "bulwark" does not exist'), { code: '3D000' })],
++    ['a certificate another CA signed', Object.assign(new Error('self-signed certificate in certificate chain'), { code: 'SELF_SIGNED_CERT_IN_CHAIN' })],
++    ['a certificate for another name', Object.assign(new Error("Hostname/IP does not match certificate's altnames"), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' })],
 +  ])('%s', (_label, error) => {
 +    expect(() => unavailable(error)).toThrow(StoreUnavailableError);
 +  });
@@ -136,6 +141,34 @@ index 000000000..9fc3bfc56
 +      stores.push(c2);
 +      await c2.ready();
 +      expect(await c2.collection('settings', { local: { dir: () => '/nonexistent' } }).get(id)).toBeNull();
++    });
++  });
++
++  describe('postgres store: expired rows go', () => {
++    const sweepPrefix = `bulwark_sweep_${tag}_`;
++    const stores: SharedStore[] = [];
++    afterAll(async () => {
++      await Promise.all(stores.map((s) => s.close()));
++      await dropTables(sweepPrefix);
++    });
++
++    it('sweeps expired kv values, leases and documents, and old counter windows, from a heartbeat', async () => {
++      const store = createPostgresStore({ tablePrefix: sweepPrefix, earlierSettingsTable: null });
++      stores.push(store);
++      await store.ready();
++      await store.kv.set('gone', 'x', { ttlMs: 50 });
++      await store.kv.set('kept', 'y');
++      await store.leases.acquire('lease', 'A', 50);
++      await store.collection('ttl', { local: { dir: () => '/nonexistent' }, ttlMs: 50 }).put('d', 'x');
++      await store.counters.hit('old', 1000, Date.now() - 120_000);
++      await new Promise((resolve) => setTimeout(resolve, 200));
++      const count = async () => admin(async (c) => (await c.query<{ n: string }>(
++        `SELECT (SELECT count(*) FROM ${sweepPrefix}kv) + (SELECT count(*) FROM ${sweepPrefix}leases)
++          + (SELECT count(*) FROM ${sweepPrefix}docs) + (SELECT count(*) FROM ${sweepPrefix}counters) AS n`)).rows[0].n);
++      expect(await count()).toBe('5');
++      await store.replicas.beat({ id: 'sweeper', version: '1', startedAt: 1 });
++      expect(await count()).toBe('1');
++      expect(await store.kv.get('kept')).toBe('y');
 +    });
 +  });
 +
@@ -207,10 +240,10 @@ index 67b054a07..c71fd7faf 100644
  }
 diff --git a/lib/shared-store/postgres.ts b/lib/shared-store/postgres.ts
 new file mode 100644
-index 000000000..3e4b9ae71
+index 000000000..9939c3327
 --- /dev/null
 +++ b/lib/shared-store/postgres.ts
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,619 @@
 +import { readFileSync } from 'node:fs';
 +import { Pool, type PoolClient, type PoolConfig } from 'pg';
 +import { isConfigReadOnly } from '@/lib/admin/paths';
@@ -276,18 +309,24 @@ index 000000000..3e4b9ae71
 +  earlierSettingsTable?: string | null;
 +}
 +
-+// Unavailable: a network error (ECONNREFUSED, ETIMEDOUT, …), a connection the
-+// server shut, refused or lost (SQLSTATE classes 08, 53, 57, 58), a
-+// serialisation failure or deadlock, and pg's own timeouts and lost
-+// connections, which carry no code. Anything else is a bug, rethrown.
-+const UNAVAILABLE_CODE = /^(E[A-Z]+|08...|53...|57...|58...|40001|40P01)$/;
++// Unavailable, as Redis counts NOAUTH, WRONGPASS and every transport error: any error code that is not a SQLSTATE
++// (a network or TLS error from Node: ECONNREFUSED, ETIMEDOUT, SELF_SIGNED_CERT_IN_CHAIN, ERR_TLS_CERT_ALTNAME_INVALID,
++// …); a SQLSTATE for a connection the server shut, refused or lost (classes 08, 53, 57, 58), a refused sign-in (28),
++// a missing database (3D000), a serialisation failure or deadlock; and pg's own timeouts and lost connections, which
++// carry no code. Anything else (a SQLSTATE about the statement itself) is a bug, rethrown.
++const NODE_ERRNO = /^E[A-Z_]+$/;
++const SQLSTATE = /^[0-9A-Z]{5}$/;
++const UNAVAILABLE_SQLSTATE = /^(08|53|57|58|28)...$|^(3D000|40001|40P01)$/;
 +const UNAVAILABLE_MESSAGE = /timeout|Connection terminated|connection error|Client has encountered a connection error/i;
 +
 +export function unavailable(error: unknown): never {
 +  if (isStoreUnavailableError(error)) throw error;
 +  const code = (error as { code?: unknown })?.code;
 +  const message = (error as Error)?.message ?? '';
-+  const known = typeof code === 'string' ? UNAVAILABLE_CODE.test(code) : UNAVAILABLE_MESSAGE.test(message);
++  // Node's errno codes first: EPIPE has a SQLSTATE's shape, and no SQLSTATE class is E and a letter.
++  const known = typeof code === 'string' && code
++    ? NODE_ERRNO.test(code) || !SQLSTATE.test(code) || UNAVAILABLE_SQLSTATE.test(code)
++    : UNAVAILABLE_MESSAGE.test(message);
 +  if (!known) throw error;
 +  throw new StoreUnavailableError(`The shared store is unavailable: ${message}`, { cause: error });
 +}
@@ -541,12 +580,11 @@ index 000000000..3e4b9ae71
 +          for (let i = 0; i < limits.length; i++) {
 +            if (r[i] === 0) r[i] = now + Math.ceil(limits[i].windowMs);
 +            n[i] += 1;
-+            await client.query(`UPDATE ${t('counters')} SET n = $2, reset_at = $3 WHERE key = $1`, [limits[i].key, n[i], r[i]]);
++            // An upsert, not an UPDATE: the periodic sweep may have deleted a stale row between this transaction's
++            // INSERT … DO NOTHING and its SELECT, which then saw none and counted from zero.
++            await client.query(`INSERT INTO ${t('counters')} (key, n, reset_at) VALUES ($1, $2, $3)
++              ON CONFLICT (key) DO UPDATE SET n = EXCLUDED.n, reset_at = EXCLUDED.reset_at`, [limits[i].key, n[i], r[i]]);
 +          }
-+        }
-+        // Windows over for a minute (the slack Redis keeps them for) go, now and then.
-+        if (Math.random() < 0.02) {
-+          await client.query(`DELETE FROM ${t('counters')} WHERE reset_at < $1`, [now - 60_000]);
 +        }
 +        return { ok, retryAfterMs: retry, counts: n, resetAts: r };
 +      });
@@ -737,10 +775,27 @@ index 000000000..3e4b9ae71
 +    },
 +  };
 +
++  // Redis drops an expired key by itself; here an expired row stays until something deletes it, and kv keys are
++  // written per access token and per code (sealed hand-off and pairing records among them). So every replica's
++  // heartbeat (every 15 s) sweeps, at most once per SWEEP_EVERY_MS in this process: expired kv values, leases and
++  // documents, and counter windows over for a minute (the slack Redis keeps them for). Each DELETE is its own
++  // statement, outside any transaction, so it never holds a lock a reservation waits on.
++  const SWEEP_EVERY_MS = 10 * 60 * 1000;
++  let lastSweep = 0;
++  async function sweepExpired(now: number): Promise<void> {
++    if (now - lastSweep < SWEEP_EVERY_MS) return;
++    lastSweep = now;
++    await q(`DELETE FROM ${t('kv')} WHERE expires_at <= now()`);
++    await q(`DELETE FROM ${t('leases')} WHERE expires_at <= now()`);
++    await q(`DELETE FROM ${t('docs')} WHERE expires_at <= now()`);
++    await q(`DELETE FROM ${t('counters')} WHERE reset_at < $1`, [now - 60_000]);
++  }
++
 +  const REPLICA_KEEP_MS = 10 * 60 * 1000;
 +  const replicas: ReplicaRegistry = {
 +    async beat(info) {
 +      const now = Date.now();
++      await sweepExpired(now);
 +      await q(`INSERT INTO ${t('replicas')} (id, info, last_seen_at) VALUES ($1, $2, $3)
 +        ON CONFLICT (id) DO UPDATE SET info = EXCLUDED.info, last_seen_at = EXCLUDED.last_seen_at`,
 +        [info.id, JSON.stringify({ ...info, lastSeenAt: now }), now]);
