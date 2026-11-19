@@ -1,664 +1,849 @@
 diff --git a/.env.example b/.env.example
-index 7634bb1..a634294 100644
+index 0fca1af6f..4121a7e3d 100644
 --- a/.env.example
 +++ b/.env.example
-@@ -125,6 +125,16 @@ JMAP_SERVER_URL=https://your-jmap-server.com
- # /app/data/settings - mount a persistent volume there (see docker-compose.yml).
- # SETTINGS_DATA_DIR=./data/settings
+@@ -151,6 +151,18 @@ JMAP_SERVER_URL=https://your-jmap-server.com
+ # allowing them to sync across browsers and devices.
+ # SETTINGS_SYNC_ENABLED=true
  
-+# More than one instance: keep the settings blobs and the device-pairing codes in
-+# PostgreSQL instead of files and memory, so every instance agrees. Connection from
-+# the standard PG* variables; TLS verified (PGSSLROOTCERT for a private CA).
++# MainThrive patch 0016: the shared store on PostgreSQL instead of Redis, for
++# several instances behind one load balancer. Everything a replica would keep
++# for itself (settings, pairing and hand-off codes, devices, limits) goes to
++# the database the standard PG* variables name; TLS is verified, against
++# PGSSLROOTCERT when set. It fails closed: nothing falls back to local files.
 +# SHARED_STORE=postgres
-+# PGHOST=db.example.org
++# PGHOST=db.internal
 +# PGDATABASE=bulwark
 +# PGUSER=bulwark
-+# PGPASSWORD=
++# PGPASSWORD=replace-me
 +# PGSSLROOTCERT=/etc/bulwark/db-ca.crt
 +
- # =============================================================================
- # Admin Dashboard Data
- # =============================================================================
-diff --git a/app/api/auth/pair/create/route.ts b/app/api/auth/pair/create/route.ts
-index df591d1..e937a62 100644
---- a/app/api/auth/pair/create/route.ts
-+++ b/app/api/auth/pair/create/route.ts
-@@ -83,7 +83,7 @@ export async function POST(request: NextRequest) {
- 
-     const { clientId, serverUrl } = getRequiredConfig(serverId);
- 
--    const { code, expiresIn } = createPairing({
-+    const { code, expiresIn } = await createPairing({
-       accessToken: tokens.access_token,
-       refreshToken: effectiveRefreshToken,
-       expiresIn: tokens.expires_in,
-diff --git a/app/api/auth/pair/redeem/route.ts b/app/api/auth/pair/redeem/route.ts
-index 0652159..c2e4752 100644
---- a/app/api/auth/pair/redeem/route.ts
-+++ b/app/api/auth/pair/redeem/route.ts
-@@ -19,7 +19,7 @@ export async function POST(request: NextRequest) {
-       return NextResponse.json({ error: 'Missing pairing code' }, { status: 400 });
-     }
- 
--    const tokens = consumePairing(pairingCode);
-+    const tokens = await consumePairing(pairingCode);
-     if (!tokens) {
-       // Unknown, expired, or already redeemed — do not distinguish.
-       return NextResponse.json({ error: 'Invalid or expired pairing code' }, { status: 400 });
-diff --git a/instrumentation.node.ts b/instrumentation.node.ts
-index 69b7aff..5edc4cb 100644
---- a/instrumentation.node.ts
-+++ b/instrumentation.node.ts
-@@ -5,10 +5,15 @@ import { migrateLegacyAdminLayout, migratePolicyUnifiedMailbox } from "./lib/adm
- import { detectSetupState } from "./lib/setup/state";
- import { ensureSetupToken } from "./lib/setup/token";
- import { installJmapUpstreamFetch } from "./lib/server/jmap-upstream-fetch";
-+import { initSharedStore } from "./lib/server/shared-store";
- 
- // Opt-in: send server-side JMAP requests privately and with the visitor's IP.
- installJmapUpstreamFetch();
- 
-+// Opt-in (SHARED_STORE=postgres): settings and pairing codes shared by every instance. Connect now,
-+// so a misconfiguration is in the log at start.
-+void initSharedStore();
-+
- const pkg = JSON.parse(
-   readFileSync(`${process.cwd()}/package.json`, "utf-8")
- );
-diff --git a/lib/__tests__/shared-store.test.ts b/lib/__tests__/shared-store.test.ts
+ # Directory for storing encrypted settings files (default: ./data/settings).
+ # For Docker, the working directory is /app, so the default resolves to
+ # /app/data/settings - mount a persistent volume there (see docker-compose.yml).
+diff --git a/lib/shared-store/__tests__/postgres-store.test.ts b/lib/shared-store/__tests__/postgres-store.test.ts
 new file mode 100644
-index 0000000..86f972c
+index 000000000..9fc3bfc56
 --- /dev/null
-+++ b/lib/__tests__/shared-store.test.ts
-@@ -0,0 +1,255 @@
-+// @vitest-environment node
-+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-+import { createHash } from 'node:crypto';
-+import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-+import { tmpdir } from 'node:os';
-+import path from 'node:path';
++++ b/lib/shared-store/__tests__/postgres-store.test.ts
+@@ -0,0 +1,122 @@
++import { randomBytes } from 'node:crypto';
++import { Client } from 'pg';
++import { afterAll, describe, expect, it } from 'vitest';
++import { versionOf } from '../keys';
++import { createPostgresStore, unavailable } from '../postgres';
++import { StoreUnavailableError, type SharedStore } from '../types';
++import { runStoreContract } from './contract';
 +
-+// SHARED_STORE=postgres: settings-sync blobs and pairing codes live in one database that every
-+// instance shares. Each "instance" below is a fresh module graph (vi.resetModules) over the same
-+// fake database, which is exactly what two pods are. The real SQL runs against a real Postgres in
-+// scripts/e2e-shared-store.sh; here the fake answers our statements by their shape.
++/**
++ * MainThrive (patch 0016). The contract against a real PostgreSQL, as
++ * redis-store.test.ts runs it against Valkey. Runs only when
++ * IT_SHARED_STORE_PG=1, with the connection in the PG* variables, so the
++ * offline unit run skips it. Tables get a random prefix and are dropped after.
++ */
++const enabled = process.env.IT_SHARED_STORE_PG === '1';
++const tag = randomBytes(4).toString('hex');
 +
-+vi.mock('@/lib/auth/session-secret', () => ({
-+  getSessionSecret: () => 's'.repeat(64),
-+  hasSessionSecret: () => true,
-+}));
-+vi.mock('@/lib/logger', () => ({
-+  logger: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
-+}));
-+
-+interface FakeDb {
-+  down: boolean;
-+  clock: number;
-+  schema: number;
-+  configs: unknown[];
-+  settings: Map<string, Buffer>;
-+  pairing: Map<string, { blob: string; expiresAt: number }>;
-+}
-+const db: FakeDb = { down: false, clock: 0, schema: 0, configs: [], settings: new Map(), pairing: new Map() };
-+
-+function answer(text: string, params: unknown[] = []): { rows: unknown[] } {
-+  const sql = text.replace(/\s+/g, ' ').trim();
-+  if (/^(BEGIN|COMMIT|ROLLBACK|SELECT pg_advisory_xact_lock)/.test(sql)) return { rows: [] };
-+  if (sql.startsWith('CREATE TABLE IF NOT EXISTS bulwark_settings')) { db.schema++; return { rows: [] }; }
-+  if (sql.startsWith('INSERT INTO bulwark_settings')) { db.settings.set(params[0] as string, params[1] as Buffer); return { rows: [] }; }
-+  if (sql.startsWith('SELECT blob FROM bulwark_settings')) {
-+    const blob = db.settings.get(params[0] as string);
-+    return { rows: blob ? [{ blob }] : [] };
++async function admin<T>(fn: (c: Client) => Promise<T>): Promise<T> {
++  const c = new Client({ ssl: process.env.PGSSLMODE === 'disable' ? false : undefined });
++  await c.connect();
++  try {
++    return await fn(c);
++  } finally {
++    await c.end();
 +  }
-+  if (sql.startsWith('DELETE FROM bulwark_settings')) { db.settings.delete(params[0] as string); return { rows: [] }; }
-+  if (sql === 'DELETE FROM bulwark_pairing WHERE expires_at <= now()') {
-+    for (const [k, v] of db.pairing) if (v.expiresAt <= db.clock) db.pairing.delete(k);
-+    return { rows: [] };
-+  }
-+  if (sql.startsWith('INSERT INTO bulwark_pairing')) {
-+    db.pairing.set((params[0] as Buffer).toString('hex'), { blob: params[1] as string, expiresAt: db.clock + (params[2] as number) });
-+    return { rows: [] };
-+  }
-+  if (sql.startsWith('DELETE FROM bulwark_pairing WHERE code_hash = $1 RETURNING')) {
-+    const k = (params[0] as Buffer).toString('hex');
-+    const rec = db.pairing.get(k);
-+    db.pairing.delete(k);
-+    return { rows: rec ? [{ blob: rec.blob, live: rec.expiresAt > db.clock }] : [] };
-+  }
-+  throw new Error(`fake db: unexpected statement: ${sql}`);
 +}
 +
-+vi.mock('pg', () => ({
-+  Pool: class {
-+    constructor(config: unknown) { db.configs.push(config); }
-+    on() {}
-+    async connect() {
-+      if (db.down) throw new Error('connect ECONNREFUSED 10.43.0.1:5432');
-+      return { query: async (t: string, p?: unknown[]) => answer(t, p), release: () => {} };
-+    }
-+    async query(t: string, p?: unknown[]) {
-+      if (db.down) throw new Error('connect ECONNREFUSED 10.43.0.1:5432');
-+      return answer(t, p);
-+    }
-+    async end() {}
-+  },
-+}));
-+
-+/** A fresh instance: its own module graph, so nothing in-process is shared with the last one. */
-+async function instance() {
-+  vi.resetModules();
-+  return {
-+    settings: await import('@/lib/settings-sync'),
-+    pairing: await import('@/lib/auth/pairing-store'),
-+    store: await import('@/lib/server/shared-store'),
-+  };
++async function dropTables(prefix: string): Promise<void> {
++  await admin(async (c) => {
++    const { rows } = await c.query<{ name: string }>(
++      "SELECT tablename AS name FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE $1", [`${prefix}%`]);
++    for (const { name } of rows) await c.query(`DROP TABLE IF EXISTS "${name}"`);
++  });
 +}
 +
-+const SERVER = 'https://mail.example.org';
-+const TOKENS = {
-+  accessToken: 'access-token-value',
-+  refreshToken: 'refresh-token-value',
-+  expiresIn: 3600,
-+  tokenEndpoint: 'https://mail.example.org/auth/token',
-+  clientId: 'webmail',
-+  serverUrl: SERVER,
-+  serverId: null,
-+};
-+
-+let dir: string;
-+beforeEach(() => {
-+  Object.assign(db, { down: false, clock: 0, schema: 0, configs: [] });
-+  db.settings.clear();
-+  db.pairing.clear();
-+  dir = mkdtempSync(path.join(tmpdir(), 'settings-'));
-+  vi.stubEnv('SETTINGS_DATA_DIR', dir);
-+  vi.stubEnv('SHARED_STORE', 'postgres');
-+  vi.stubEnv('PGSSLMODE', '');
-+  vi.stubEnv('PGSSLROOTCERT', '');
-+});
-+afterEach(() => {
-+  vi.unstubAllEnvs();
-+  rmSync(dir, { recursive: true, force: true });
-+});
-+
-+describe('settings, shared by every instance', () => {
-+  it('a save on one instance loads on another, and a later save on the second wins on the first', async () => {
-+    const a = await instance();
-+    await a.settings.saveUserSettings('u@example.org', SERVER, { theme: 'dark' });
-+    const b = await instance();
-+    expect(await b.settings.loadUserSettings('u@example.org', SERVER)).toEqual({ theme: 'dark' });
-+    await b.settings.saveUserSettings('u@example.org', SERVER, { theme: 'light' });
-+    expect(await a.settings.loadUserSettings('u@example.org', SERVER)).toEqual({ theme: 'light' });
++describe('postgres store: which errors mean unavailable', () => {
++  it.each([
++    ['a refused connection', Object.assign(new Error('connect ECONNREFUSED 10.0.0.1:5432'), { code: 'ECONNREFUSED' })],
++    ['a server shutting down', Object.assign(new Error('terminating connection due to administrator command'), { code: '57P01' })],
++    ['too many clients', Object.assign(new Error('sorry, too many clients already'), { code: '53300' })],
++    ['a lost connection', new Error('Connection terminated unexpectedly')],
++    ['a query that timed out', new Error('Query read timeout')],
++  ])('%s', (_label, error) => {
++    expect(() => unavailable(error)).toThrow(StoreUnavailableError);
 +  });
 +
-+  it('keeps the file format and name: the row is the encrypted blob under the file name, and no file is written', async () => {
-+    const a = await instance();
-+    await a.settings.saveUserSettings('u@example.org', SERVER, { signature: 'secret-signature' });
-+    const key = createHash('sha256').update(`u@example.org:${SERVER}`).digest('hex');
-+    expect([...db.settings.keys()]).toEqual([key]);
-+    expect(db.settings.get(key)!.toString('latin1')).not.toContain('secret-signature');
-+    expect(readdirSync(dir)).toEqual([]);
-+    // The same bytes, as a file, load in file mode: a legacy file can be imported as-is.
-+    writeFileSync(path.join(dir, `${key}.enc`), db.settings.get(key)!);
-+    vi.stubEnv('SHARED_STORE', '');
-+    const f = await instance();
-+    expect(await f.settings.loadUserSettings('u@example.org', SERVER)).toEqual({ signature: 'secret-signature' });
-+  });
-+
-+  it('a delete on one instance is gone on the other; accounts do not share a row', async () => {
-+    const a = await instance();
-+    await a.settings.saveUserSettings('u@example.org', SERVER, { theme: 'dark' });
-+    await a.settings.saveUserSettings('v@example.org', SERVER, { theme: 'light' });
-+    const b = await instance();
-+    await b.settings.deleteUserSettings('u@example.org', SERVER);
-+    expect(await a.settings.loadUserSettings('u@example.org', SERVER)).toBeNull();
-+    expect(await a.settings.loadUserSettings('v@example.org', SERVER)).toEqual({ theme: 'light' });
-+  });
-+
-+  it('fails closed: with the database down a save and a load throw, naming no internals, and nothing falls back to a file', async () => {
-+    db.down = true;
-+    const a = await instance();
-+    await expect(a.settings.saveUserSettings('u@example.org', SERVER, { theme: 'dark' })).rejects.toThrow(/^Shared store unavailable$/);
-+    await expect(a.settings.loadUserSettings('u@example.org', SERVER)).rejects.toThrow(/^Shared store unavailable$/);
-+    await expect(a.settings.deleteUserSettings('u@example.org', SERVER)).rejects.toThrow(/^Shared store unavailable$/);
-+    expect(readdirSync(dir)).toEqual([]);
-+  });
-+
-+  it('a failed connection is not cached: once the database is back, the same instance works', async () => {
-+    db.down = true;
-+    const a = await instance();
-+    await expect(a.settings.saveUserSettings('u@example.org', SERVER, { theme: 'dark' })).rejects.toThrow();
-+    db.down = false;
-+    await a.settings.saveUserSettings('u@example.org', SERVER, { theme: 'dark' });
-+    expect(await a.settings.loadUserSettings('u@example.org', SERVER)).toEqual({ theme: 'dark' });
-+    expect(db.schema).toBe(1);
-+  });
-+
-+  it('without SHARED_STORE nothing changes: the file, and no connection at all', async () => {
-+    vi.stubEnv('SHARED_STORE', '');
-+    const a = await instance();
-+    await a.settings.saveUserSettings('u@example.org', SERVER, { theme: 'dark' });
-+    expect(readdirSync(dir)).toHaveLength(1);
-+    expect(await a.settings.loadUserSettings('u@example.org', SERVER)).toEqual({ theme: 'dark' });
-+    expect(db.configs).toEqual([]);
-+    expect(db.settings.size).toBe(0);
++  it.each([
++    ['a syntax error', Object.assign(new Error('syntax error at or near "SELEC"'), { code: '42601' })],
++    ['a unique violation', Object.assign(new Error('duplicate key value'), { code: '23505' })],
++    ['a plain bug', new TypeError('x is not a function')],
++  ])('not %s', (_label, error) => {
++    expect(() => unavailable(error)).toThrow(error.message);
++    expect(() => unavailable(error)).not.toThrow(StoreUnavailableError);
 +  });
 +});
 +
-+describe('pairing codes, shared by every instance', () => {
-+  it('a code minted on one instance redeems once on another, and never again on either', async () => {
-+    const a = await instance();
-+    const { code, expiresIn } = await a.pairing.createPairing(TOKENS);
-+    expect(code).toMatch(/^[0-9a-f]{64}$/);
-+    expect(expiresIn).toBe(120);
-+    const b = await instance();
-+    expect(await b.pairing.consumePairing(code)).toEqual(TOKENS);
-+    expect(await b.pairing.consumePairing(code)).toBeNull();
-+    expect(await a.pairing.consumePairing(code)).toBeNull();
++if (!enabled) {
++  describe('shared store contract: postgres', () => {
++    it.skip('needs IT_SHARED_STORE_PG=1 and the PG* variables', () => {});
++  });
++} else {
++  const prefix = `bulwark_test_${tag}_`;
++  const opened: SharedStore[] = [];
++  runStoreContract({
++    name: `postgres (${prefix})`,
++    makeStores: (n) => {
++      const stores = Array.from({ length: n }, () => createPostgresStore({ tablePrefix: prefix, earlierSettingsTable: null }));
++      opened.push(...stores);
++      return stores;
++    },
++    cleanup: async () => {
++      await Promise.all(opened.map((s) => s.close()));
++      await dropTables(prefix);
++    },
 +  });
 +
-+  it('stores the code only as its hash, and the tokens only encrypted', async () => {
-+    const a = await instance();
-+    const { code } = await a.pairing.createPairing(TOKENS);
-+    const [[key, rec]] = [...db.pairing];
-+    expect(key).toBe(createHash('sha256').update(code).digest('hex'));
-+    expect(rec.blob).not.toContain(code);
-+    expect(Buffer.from(rec.blob, 'base64').toString('latin1')).not.toContain('access-token-value');
++  describe('postgres store: the settings the earlier store kept', () => {
++    const carryPrefix = `bulwark_carry_${tag}_`;
++    const earlier = `bulwark_carry_${tag}_old`;
++    const stores: SharedStore[] = [];
++    afterAll(async () => {
++      await Promise.all(stores.map((s) => s.close()));
++      await dropTables(carryPrefix);
++    });
++
++    it('carries them over once, byte for byte, and keeps the old rows under another name', async () => {
++      const id = 'a'.repeat(64);
++      const blob = randomBytes(80);
++      await admin(async (c) => {
++        await c.query(`CREATE TABLE ${earlier} (key text PRIMARY KEY, blob bytea NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())`);
++        await c.query(`INSERT INTO ${earlier} (key, blob) VALUES ($1, $2), ('not-a-settings-id', 'x')`, [id, blob]);
++      });
++      // Two replicas starting at once: one carries over, the other finds it done.
++      const [a, b] = [0, 1].map(() => createPostgresStore({ tablePrefix: carryPrefix, earlierSettingsTable: earlier }));
++      stores.push(a, b);
++      await Promise.all([a.ready(), b.ready()]);
++      const doc = await b.collection('settings', { local: { dir: () => '/nonexistent' } }).get(id);
++      expect(doc?.data.equals(blob)).toBe(true);
++      expect(doc?.version).toBe(versionOf(blob));
++      expect(await a.collection('settings', { local: { dir: () => '/nonexistent' } }).list()).toEqual([id]);
++      const tables = await admin(async (c) => (await c.query<{ old: string | null; kept: string | null }>(
++        'SELECT to_regclass($1)::text AS old, to_regclass($2)::text AS kept', [earlier, `${earlier}_before_1_21`])).rows[0]);
++      expect(tables).toEqual({ old: null, kept: `${earlier}_before_1_21` });
++      // A later start finds nothing to carry over, so a deleted settings document stays deleted.
++      await a.collection('settings', { local: { dir: () => '/nonexistent' } }).delete(id);
++      const c2 = createPostgresStore({ tablePrefix: carryPrefix, earlierSettingsTable: earlier });
++      stores.push(c2);
++      await c2.ready();
++      expect(await c2.collection('settings', { local: { dir: () => '/nonexistent' } }).get(id)).toBeNull();
++    });
 +  });
 +
-+  it('an expired code is refused, and is swept by the next mint', async () => {
-+    const a = await instance();
-+    const { code: old } = await a.pairing.createPairing(TOKENS);
-+    db.clock += 120_000;
-+    expect(await a.pairing.consumePairing(old)).toBeNull();
-+    const { code: older } = await a.pairing.createPairing(TOKENS);
-+    db.clock += 120_001;
-+    await a.pairing.createPairing(TOKENS);
-+    expect(db.pairing.size).toBe(1);
-+    expect(await a.pairing.consumePairing(older)).toBeNull();
++  describe('postgres store: an unreachable database', () => {
++    it('is StoreUnavailableError, never a fallback', async () => {
++      const store = createPostgresStore({ tablePrefix: prefix, earlierSettingsTable: null, pool: { host: '127.0.0.1', port: 1, connectionTimeoutMillis: 500 } });
++      await expect(store.kv.get('k')).rejects.toBeInstanceOf(StoreUnavailableError);
++      await expect(store.ping(2000)).rejects.toBeInstanceOf(StoreUnavailableError);
++      expect(store.status().connected).toBe(false);
++      await store.close();
++    });
 +  });
-+
-+  it('an unknown code is refused', async () => {
-+    const a = await instance();
-+    expect(await a.pairing.consumePairing('0'.repeat(64))).toBeNull();
-+  });
-+
-+  it('fails closed with the database down: neither a mint nor a redeem succeeds', async () => {
-+    db.down = true;
-+    const a = await instance();
-+    await expect(a.pairing.createPairing(TOKENS)).rejects.toThrow(/^Shared store unavailable$/);
-+    await expect(a.pairing.consumePairing('0'.repeat(64))).rejects.toThrow(/^Shared store unavailable$/);
-+  });
-+
-+  it('without SHARED_STORE it is the in-process store, so another instance cannot redeem', async () => {
-+    vi.stubEnv('SHARED_STORE', '');
-+    const a = await instance();
-+    const { code } = await a.pairing.createPairing(TOKENS);
-+    const b = await instance();
-+    expect(await b.pairing.consumePairing(code)).toBeNull();
-+    expect(await a.pairing.consumePairing(code)).toEqual(TOKENS);
-+    expect(db.configs).toEqual([]);
-+  });
-+});
-+
-+describe('the connection verifies TLS by default, against PGSSLROOTCERT when given, and turns it off only for PGSSLMODE=disable', () => {
-+  it.each<[string, Record<string, string>, unknown]>([
-+    ['default', {}, true],
-+    ['a private CA', { PGSSLROOTCERT: 'ca.crt' }, { ca: 'CA-PEM' }],
-+    ['disable', { PGSSLMODE: 'disable' }, false],
-+  ])('%s', async (_label, env, ssl) => {
-+    writeFileSync(path.join(dir, 'ca.crt'), 'CA-PEM');
-+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, k === 'PGSSLROOTCERT' ? path.join(dir, v) : v);
-+    const a = await instance();
-+    await a.store.sharedStore();
-+    expect(db.configs).toEqual([expect.objectContaining({ ssl })]);
-+  });
-+
-+  it('re-reads the CA at each connection, so a renewed CA needs no restart', async () => {
-+    const ca = path.join(dir, 'ca.crt');
-+    writeFileSync(ca, 'OLD-CA');
-+    vi.stubEnv('PGSSLROOTCERT', ca);
-+    const a = await instance();
-+    await a.store.sharedStore();
-+    const ssl = (db.configs[0] as { ssl: { ca: string } }).ssl;
-+    expect({ ...ssl }).toEqual({ ca: 'OLD-CA' });
-+    writeFileSync(ca, 'NEW-CA');
-+    expect({ ...ssl }).toEqual({ ca: 'NEW-CA' });
-+  });
-+});
-diff --git a/lib/auth/crypto.ts b/lib/auth/crypto.ts
-index ac39563..8571910 100644
---- a/lib/auth/crypto.ts
-+++ b/lib/auth/crypto.ts
-@@ -79,7 +79,9 @@ export type PayloadPurpose =
-   /** WOPI access token, scoped to one file node and a six-hour expiry. */
-   | 'wopi-token'
-   /** The app password an impersonation handoff minted, kept for revocation. */
--  | 'impersonation-grant';
-+  | 'impersonation-grant'
-+  /** A device-pairing record in the shared store (lib/auth/pairing-store.ts). */
-+  | 'pairing';
++}
+diff --git a/lib/shared-store/index.ts b/lib/shared-store/index.ts
+index 67b054a07..c71fd7faf 100644
+--- a/lib/shared-store/index.ts
++++ b/lib/shared-store/index.ts
+@@ -3,6 +3,7 @@ import { logger } from '@/lib/logger';
+ import { readFileEnv } from '@/lib/read-file-env';
+ import { createLocalStore } from './local';
+ import { createRedisStore, randomHolderSuffix } from './redis';
++import { createPostgresStore, postgresStoreSelected } from './postgres';
+ import type { SharedStore } from './types';
  
+ export * from './types';
+@@ -40,11 +41,18 @@ function globals(): StoreGlobals {
+   return (g[KEY] ??= {});
+ }
+ 
+-/** The shared store URL from REDIS_URL or REDIS_URL_FILE, or null for local mode. */
++/**
++ * The shared store URL from REDIS_URL or REDIS_URL_FILE, or null for local mode.
++ * MainThrive (patch 0016): with SHARED_STORE=postgres, `postgres:`; the
++ * connection itself is the PG* variables (lib/shared-store/postgres.ts).
++ */
+ export function sharedStoreUrl(): string | null {
++  if (postgresStoreSelected()) return POSTGRES_URL;
+   return process.env.REDIS_URL || readFileEnv(process.env.REDIS_URL_FILE) || null;
+ }
+ 
++const POSTGRES_URL = 'postgres:';
++
  /**
-  * Whether a blob minted before purposes were bound may be re-admitted for
-@@ -98,6 +100,7 @@ const LEGACY_PAYLOAD_MARKERS: Record<PayloadPurpose, (payload: Record<string, un
-   'pair-reauth': (p) => p.purpose === 'pair',
-   'wopi-token': (p) => p.t === 'wopi',
-   'impersonation-grant': () => false,
-+  'pairing': () => false,
+  * The password ioredis will send for a store address, read the way its
+  * parseURL reads it (ioredis 5, built/utils/index.js): '' for none,
+@@ -97,6 +105,8 @@ const REFUSAL_LOG: Record<StoreRefusal, string> = {
  };
  
- export function encryptPayload(payload: Record<string, unknown>, purpose: PayloadPurpose): string {
-diff --git a/lib/auth/pairing-store.ts b/lib/auth/pairing-store.ts
-index 2604143..e0920ff 100644
---- a/lib/auth/pairing-store.ts
-+++ b/lib/auth/pairing-store.ts
-@@ -1,4 +1,6 @@
--import { randomBytes } from 'crypto';
-+import { createHash, randomBytes } from 'crypto';
-+import { encryptPayload, decryptPayload } from '@/lib/auth/crypto';
-+import { sharedStoreEnabled, putPairing, takePairing } from '@/lib/server/shared-store';
- 
- // Cross-device login pairing. A signed-in desktop session mints a short-lived,
- // single-use pairing code (see /api/auth/pair/create) which is rendered as a
-@@ -11,6 +13,11 @@ import { randomBytes } from 'crypto';
- // (pm2) deployments this webmail targets; a multi-instance deployment would
- // need to swap this for a shared store (Redis) keyed the same way. Records are
- // tiny and expire within PAIRING_TTL_MS, so memory pressure is negligible.
-+//
-+// With SHARED_STORE=postgres (lib/server/shared-store.ts) the records live there instead, so a code
-+// minted on one instance redeems on another. The row is keyed by the code's SHA-256, never the code,
-+// and holds the tokens encrypted under SESSION_SECRET (purpose 'pairing'). The single DELETE that
-+// redeems it is what keeps it single-use across instances.
- 
- export interface PairingTokens {
-   accessToken: string;
-@@ -39,18 +46,32 @@ function sweep(now: number): void {
+ function refusalOf(url: string): StoreRefusal | null {
++  // The PG* variables carry the credential, and the database refuses a connection without one.
++  if (url === POSTGRES_URL) return null;
+   const password = storeUrlPassword(url);
+   if (password === undefined) return 'invalid-url';
+   if (password || process.env.SHARED_STORE_ALLOW_NO_PASSWORD?.trim().toLowerCase() === 'true') return null;
+@@ -120,9 +130,11 @@ export function getStore(): SharedStore {
+       g.refusalLogged = true;
+       throw new Error(REFUSAL_LOG[refusal]);
+     }
+-    g.store = url
+-      ? createRedisStore({ url, keyPrefix: process.env.REDIS_KEY_PREFIX || 'bulwark:' })
+-      : createLocalStore();
++    g.store = url === POSTGRES_URL
++      ? createPostgresStore()
++      : url
++        ? createRedisStore({ url, keyPrefix: process.env.REDIS_KEY_PREFIX || 'bulwark:' })
++        : createLocalStore();
    }
+   return g.store;
  }
- 
--export function createPairing(tokens: PairingTokens): { code: string; expiresIn: number } {
--  const now = Date.now();
--  sweep(now);
-+const codeHash = (code: string): Buffer => createHash('sha256').update(code).digest();
-+
-+export async function createPairing(tokens: PairingTokens): Promise<{ code: string; expiresIn: number }> {
-   const code = randomBytes(CODE_BYTES).toString('hex');
--  store.set(code, { ...tokens, expiresAt: now + PAIRING_TTL_MS });
-+  if (sharedStoreEnabled()) {
-+    await putPairing(codeHash(code), encryptPayload({ ...tokens }, 'pairing'), PAIRING_TTL_MS);
-+  } else {
-+    const now = Date.now();
-+    sweep(now);
-+    store.set(code, { ...tokens, expiresAt: now + PAIRING_TTL_MS });
-+  }
-   return { code, expiresIn: Math.floor(PAIRING_TTL_MS / 1000) };
- }
- 
- // Single-use: a successful lookup removes the record so a code can never be
- // redeemed twice. Returns null for unknown, expired, or already-redeemed codes
- // — the caller must not distinguish these to avoid leaking code validity.
--export function consumePairing(code: string): PairingTokens | null {
-+export async function consumePairing(code: string): Promise<PairingTokens | null> {
-+  if (sharedStoreEnabled()) {
-+    const blob = await takePairing(codeHash(code));
-+    if (!blob) return null;
-+    const payload = decryptPayload(blob, 'pairing');
-+    if (!payload) return null;
-+    const { p: _purpose, ...tokens } = payload;
-+    return tokens as unknown as PairingTokens;
-+  }
-   const now = Date.now();
-   sweep(now);
-   const record = store.get(code);
-diff --git a/lib/server/shared-store.ts b/lib/server/shared-store.ts
+diff --git a/lib/shared-store/postgres.ts b/lib/shared-store/postgres.ts
 new file mode 100644
-index 0000000..a6d65dc
+index 000000000..3e4b9ae71
 --- /dev/null
-+++ b/lib/server/shared-store.ts
-@@ -0,0 +1,150 @@
++++ b/lib/shared-store/postgres.ts
+@@ -0,0 +1,597 @@
 +import { readFileSync } from 'node:fs';
-+import { Pool, type PoolConfig } from 'pg';
++import { Pool, type PoolClient, type PoolConfig } from 'pg';
++import { isConfigReadOnly } from '@/lib/admin/paths';
 +import { logger } from '@/lib/logger';
++import { assertDocId, assertKey, assertName, toBuffer, versionOf } from './keys';
++import { localCollection } from './local';
++import {
++  StoreUnavailableError,
++  isStoreUnavailableError,
++  type AppendLog,
++  type CollectionOptions,
++  type CounterStore,
++  type DocCollection,
++  type EpochStore,
++  type KvStore,
++  type LeaseStore,
++  type LogOptions,
++  type PutOptions,
++  type PutResult,
++  type ReplicaInfo,
++  type ReplicaRegistry,
++  type SharedStore,
++  type StoredDoc,
++} from './types';
 +
-+// A store every instance shares, for the two things upstream keeps per instance: the settings-sync
-+// blobs (lib/settings-sync.ts, otherwise files under data/settings) and the device-pairing codes
-+// (lib/auth/pairing-store.ts, otherwise an in-process Map). With it, any number of instances behind
-+// one load balancer agree on both; sessions are already stateless cookies under SESSION_SECRET.
-+//
-+// Opt-in: SHARED_STORE=postgres. The connection comes from the standard PG* variables (PGHOST,
-+// PGPORT, PGDATABASE, PGUSER, PGPASSWORD), which `pg` reads itself. TLS is verified: against
-+// PGSSLROOTCERT when set, else the system's CAs; PGSSLMODE=disable turns it off (tests only).
-+//
-+// It fails closed: with the store configured and unreachable, a settings save or a pairing answers
-+// an error. It never falls back to the per-instance file or Map, where two instances would disagree.
++/**
++ * MainThrive (patch 0016): the shared store on PostgreSQL, a third backend
++ * beside local and redis, selected by SHARED_STORE=postgres. It keeps every
++ * piece of state upstream shares between replicas (#1066) in one database,
++ * which for MainThrive is mail-pg's `bulwark` database: durable and backed
++ * up, where a Redis-protocol store would hold settings in memory.
++ *
++ * Every check-then-write is one statement or one transaction, so it is atomic
++ * on the server, as the Lua scripts are for redis. Counter windows use the
++ * caller's clock, as there; expiry (kv, documents, leases) uses the
++ * database's, as Redis uses its own.
++ *
++ * The connection is the standard PG* variables (PGHOST, PGPORT, PGDATABASE,
++ * PGUSER, PGPASSWORD), which `pg` reads itself. TLS is verified: against
++ * PGSSLROOTCERT when set, else the system's CAs; PGSSLMODE=disable turns it
++ * off (tests only). Like redis it fails closed: an unreachable database is a
++ * StoreUnavailableError, never a fallback to local files.
++ *
++ * On first start it carries over the settings the earlier patch kept in
++ * `bulwark_settings` (same id, same bytes: both are sha256 of user:server and
++ * iv‖tag‖ciphertext under SESSION_SECRET), then renames that table to
++ * `bulwark_settings_before_1_21`, so the copy runs once and the old rows stay
++ * as they were.
++ */
 +
-+export function sharedStoreEnabled(): boolean {
-+  return process.env.SHARED_STORE === 'postgres';
++export function postgresStoreSelected(): boolean {
++  return process.env.SHARED_STORE?.trim().toLowerCase() === 'postgres';
 +}
 +
-+const SCHEMA = `
-+CREATE TABLE IF NOT EXISTS bulwark_settings (
++export interface PostgresStoreOptions {
++  /** Prefix of every table, so tests can use their own. Default `bulwark_store_`. */
++  tablePrefix?: string;
++  /** Per-statement timeout (ms). Default 5000. */
++  queryTimeoutMs?: number;
++  /** Override the pool settings (tests). */
++  pool?: PoolConfig;
++  /** The earlier patch's settings table, carried over once. Default `bulwark_settings`; null skips it. */
++  earlierSettingsTable?: string | null;
++}
++
++// Unavailable: a network error (ECONNREFUSED, ETIMEDOUT, …), a connection the
++// server shut, refused or lost (SQLSTATE classes 08, 53, 57, 58), a
++// serialisation failure or deadlock, and pg's own timeouts and lost
++// connections, which carry no code. Anything else is a bug, rethrown.
++const UNAVAILABLE_CODE = /^(E[A-Z]+|08...|53...|57...|58...|40001|40P01)$/;
++const UNAVAILABLE_MESSAGE = /timeout|Connection terminated|connection error|Client has encountered a connection error/i;
++
++export function unavailable(error: unknown): never {
++  if (isStoreUnavailableError(error)) throw error;
++  const code = (error as { code?: unknown })?.code;
++  const message = (error as Error)?.message ?? '';
++  const known = typeof code === 'string' ? UNAVAILABLE_CODE.test(code) : UNAVAILABLE_MESSAGE.test(message);
++  if (!known) throw error;
++  throw new StoreUnavailableError(`The shared store is unavailable: ${message}`, { cause: error });
++}
++
++function schemaSql(t: (name: string) => string): string {
++  return `
++CREATE TABLE IF NOT EXISTS ${t('kv')} (
 +  key        text PRIMARY KEY,
-+  blob       bytea NOT NULL,
-+  updated_at timestamptz NOT NULL DEFAULT now()
++  value      text NOT NULL,
++  expires_at timestamptz
 +);
-+CREATE TABLE IF NOT EXISTS bulwark_pairing (
-+  code_hash  bytea PRIMARY KEY,
-+  blob       text NOT NULL,
++CREATE TABLE IF NOT EXISTS ${t('counters')} (
++  key      text PRIMARY KEY,
++  n        bigint NOT NULL,
++  reset_at bigint NOT NULL
++);
++CREATE TABLE IF NOT EXISTS ${t('docs')} (
++  coll       text NOT NULL,
++  id         text NOT NULL,
++  data       bytea NOT NULL,
++  version    text NOT NULL,
++  expires_at timestamptz,
++  PRIMARY KEY (coll, id)
++);
++CREATE TABLE IF NOT EXISTS ${t('logs')} (
++  seq  bigserial PRIMARY KEY,
++  name text NOT NULL,
++  line text NOT NULL
++);
++CREATE INDEX IF NOT EXISTS ${t('logs_name')} ON ${t('logs')} (name, seq);
++CREATE TABLE IF NOT EXISTS ${t('leases')} (
++  name       text PRIMARY KEY,
++  holder     text NOT NULL,
 +  expires_at timestamptz NOT NULL
++);
++CREATE TABLE IF NOT EXISTS ${t('epochs')} (
++  area text PRIMARY KEY,
++  n    bigint NOT NULL
++);
++CREATE TABLE IF NOT EXISTS ${t('replicas')} (
++  id           text PRIMARY KEY,
++  info         text NOT NULL,
++  last_seen_at bigint NOT NULL
 +);`;
++}
 +
-+// Any fixed key: it only serialises the two instances' CREATE TABLE IF NOT EXISTS, which can
-+// otherwise race to a unique violation on the catalog when both start at once.
-+const SCHEMA_LOCK = 4_111_406;
++// Any fixed key: it serialises the replicas' CREATE TABLE IF NOT EXISTS and the
++// one-time carry-over, which would otherwise race when both start at once.
++const SCHEMA_LOCK = 4_111_442;
++const LIVE = '(expires_at IS NULL OR expires_at > now())';
 +
-+let pool: Pool | null = null;
-+let ready: Promise<Pool> | null = null;
-+
-+function poolConfig(): PoolConfig {
++function poolConfig(options: PostgresStoreOptions): PoolConfig {
 +  const mode = process.env.PGSSLMODE;
 +  const ca = process.env.PGSSLROOTCERT;
 +  return {
 +    max: 4,
-+    // Settings traffic is sparse: keep a connection long enough that a save rarely pays a new TLS + SCRAM handshake.
++    // Keep a connection long enough that a request rarely pays a new TLS + SCRAM handshake.
 +    idleTimeoutMillis: 300_000,
 +    connectionTimeoutMillis: 5_000,
-+    query_timeout: 5_000,
++    query_timeout: options.queryTimeoutMs ?? 5_000,
++    // The same bound on the server: query_timeout only stops waiting, and a statement it gave up on would otherwise
++    // keep running there, holding its locks.
++    statement_timeout: options.queryTimeoutMs ?? 5_000,
 +    // The CA is read at each new connection, not once: a mounted Secret is updated in place when CNPG renews its CA,
 +    // and a pod that outlived the old one would otherwise refuse every new connection until restarted.
 +    ssl: mode === 'disable' ? false : ca ? { get ca() { return readFileSync(ca, 'utf8'); } } : true,
++    ...options.pool,
 +  };
 +}
 +
-+async function open(): Promise<Pool> {
-+  if (!pool) {
-+    pool = new Pool(poolConfig());
-+    // An idle client's error (the server restarted, a switchover) must not crash the process; the
-+    // pool drops that client and the next query opens another.
-+    pool.on('error', (err) => logger.warn('Shared store: idle connection lost', { error: err.message }));
++export function createPostgresStore(options: PostgresStoreOptions = {}): SharedStore {
++  const prefix = options.tablePrefix ?? 'bulwark_store_';
++  if (!/^[a-z_][a-z0-9_]{0,40}$/.test(prefix)) throw new Error(`Invalid table prefix: ${prefix}`);
++  const t = (name: string) => `${prefix}${name}`;
++  const earlier = options.earlierSettingsTable === undefined ? 'bulwark_settings' : options.earlierSettingsTable;
++  if (earlier !== null && !/^[a-z_][a-z0-9_]{0,40}$/.test(earlier)) throw new Error(`Invalid table name: ${earlier}`);
++  const pool = new Pool(poolConfig(options));
++  // An idle client's error (the server restarted, a switchover) must not crash
++  // the process: the pool drops that client and the next query opens another.
++  pool.on('error', (err) => logger.warn('Shared store: idle connection lost', { error: err.message }));
++  let connected = false;
++
++  let schema: Promise<void> | null = null;
++  function ensureSchema(): Promise<void> {
++    schema ??= (async () => {
++      const client = await pool.connect();
++      try {
++        await client.query('BEGIN');
++        await client.query('SELECT pg_advisory_xact_lock($1)', [SCHEMA_LOCK]);
++        await client.query(schemaSql(t));
++        await carryOverEarlierSettings(client);
++        await client.query('COMMIT');
++      } catch (err) {
++        await client.query('ROLLBACK').catch(() => undefined);
++        throw err;
++      } finally {
++        client.release();
++      }
++    })().catch((err) => {
++      // Not cached: the next call tries again.
++      schema = null;
++      throw err;
++    });
++    return schema;
 +  }
-+  const client = await pool.connect();
-+  try {
-+    await client.query('BEGIN');
-+    await client.query('SELECT pg_advisory_xact_lock($1)', [SCHEMA_LOCK]);
-+    await client.query(SCHEMA);
-+    await client.query('COMMIT');
-+  } catch (err) {
-+    await client.query('ROLLBACK').catch(() => undefined);
-+    throw err;
-+  } finally {
-+    client.release();
++
++  async function carryOverEarlierSettings(client: PoolClient): Promise<void> {
++    if (earlier === null) return;
++    const { rows: [old] } = await client.query<{ present: boolean }>('SELECT to_regclass($1) IS NOT NULL AS present', [earlier]);
++    if (!old?.present) return;
++    const { rows } = await client.query<{ key: string; blob: Buffer }>(`SELECT key, blob FROM ${earlier}`);
++    for (const row of rows) {
++      // An id that is not one settings-sync would make is left behind with the old table.
++      if (!/^[0-9a-f]{64}$/.test(row.key)) continue;
++      await client.query(
++        `INSERT INTO ${t('docs')} (coll, id, data, version) VALUES ('settings', $1, $2, $3) ON CONFLICT (coll, id) DO NOTHING`,
++        [row.key, row.blob, versionOf(row.blob)],
++      );
++    }
++    await client.query(`ALTER TABLE ${earlier} RENAME TO ${earlier}_before_1_21`);
++    logger.info('Shared store: carried over the settings the earlier store kept', { settings: rows.length });
 +  }
-+  return pool;
-+}
 +
-+/** The pool, with the schema in place. A failure is not cached: the next call tries again. */
-+export function sharedStore(): Promise<Pool> {
-+  ready ??= open().catch((err) => {
-+    ready = null;
-+    throw err;
-+  });
-+  return ready;
-+}
-+
-+/** Runs `fn` on the store, logging the cause and throwing a message that names no internals. */
-+async function withStore<T>(what: string, fn: (db: Pool) => Promise<T>): Promise<T> {
-+  try {
-+    return await fn(await sharedStore());
-+  } catch (err) {
-+    logger.error(`Shared store: ${what} failed`, { error: err instanceof Error ? err.message : 'Unknown error' });
-+    throw new Error('Shared store unavailable');
++  async function q<R extends Record<string, unknown> = Record<string, unknown>>(sql: string, params: unknown[] = []) {
++    try {
++      await ensureSchema();
++      const result = await pool.query<R>(sql, params);
++      connected = true;
++      return result;
++    } catch (error) {
++      connected = false;
++      return unavailable(error);
++    }
 +  }
-+}
 +
-+export function putSettingsBlob(key: string, blob: Buffer): Promise<void> {
-+  return withStore('settings save', async (db) => {
-+    await db.query(
-+      `INSERT INTO bulwark_settings (key, blob) VALUES ($1, $2)
-+       ON CONFLICT (key) DO UPDATE SET blob = EXCLUDED.blob, updated_at = now()`,
-+      [key, blob],
-+    );
-+  });
-+}
-+
-+export function getSettingsBlob(key: string): Promise<Buffer | null> {
-+  return withStore('settings load', async (db) => {
-+    const { rows } = await db.query<{ blob: Buffer }>('SELECT blob FROM bulwark_settings WHERE key = $1', [key]);
-+    return rows[0]?.blob ?? null;
-+  });
-+}
-+
-+export function deleteSettingsBlob(key: string): Promise<void> {
-+  return withStore('settings delete', async (db) => {
-+    await db.query('DELETE FROM bulwark_settings WHERE key = $1', [key]);
-+  });
-+}
-+
-+/** Stores a pairing record that expires `ttlMs` from now by the DATABASE's clock, and sweeps expired ones. */
-+export function putPairing(codeHash: Buffer, blob: string, ttlMs: number): Promise<void> {
-+  return withStore('pairing create', async (db) => {
-+    await db.query('DELETE FROM bulwark_pairing WHERE expires_at <= now()');
-+    await db.query(
-+      `INSERT INTO bulwark_pairing (code_hash, blob, expires_at) VALUES ($1, $2, now() + $3 * interval '1 millisecond')`,
-+      [codeHash, blob, ttlMs],
-+    );
-+  });
-+}
-+
-+/** Removes the record and returns it if it had not expired. Single-use across every instance: one DELETE wins. */
-+export function takePairing(codeHash: Buffer): Promise<string | null> {
-+  return withStore('pairing redeem', async (db) => {
-+    const { rows } = await db.query<{ blob: string; live: boolean }>(
-+      'DELETE FROM bulwark_pairing WHERE code_hash = $1 RETURNING blob, expires_at > now() AS live',
-+      [codeHash],
-+    );
-+    return rows[0]?.live ? rows[0].blob : null;
-+  });
-+}
-+
-+/** At start-up: connect and create the schema, so a misconfiguration is in the log at once, not at the first save. */
-+export async function initSharedStore(): Promise<void> {
-+  if (!sharedStoreEnabled()) return;
-+  try {
-+    await sharedStore();
-+    console.info('Shared store: ready (postgres)');
-+  } catch (err) {
-+    console.error('Shared store: FAILED to connect or create its schema:', err instanceof Error ? err.message : err);
++  async function tx<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
++    let client: PoolClient | undefined;
++    try {
++      await ensureSchema();
++      client = await pool.connect();
++      await client.query('BEGIN');
++      const result = await fn(client);
++      await client.query('COMMIT');
++      connected = true;
++      return result;
++    } catch (error) {
++      if (client) await client.query('ROLLBACK').catch(() => undefined);
++      connected = false;
++      return unavailable(error);
++    } finally {
++      client?.release();
++    }
 +  }
-+}
-diff --git a/lib/settings-sync.ts b/lib/settings-sync.ts
-index 6a5fb1b..515480b 100644
---- a/lib/settings-sync.ts
-+++ b/lib/settings-sync.ts
-@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
- import path from 'node:path';
- import { logger } from '@/lib/logger';
- import { getSessionSecret } from '@/lib/auth/session-secret';
-+import { sharedStoreEnabled, putSettingsBlob, getSettingsBlob, deleteSettingsBlob } from '@/lib/server/shared-store';
- 
- const ALGORITHM = 'aes-256-gcm';
- const IV_LENGTH = 12;
-@@ -19,9 +20,13 @@ function getSettingsDir(): string {
-   return process.env.SETTINGS_DATA_DIR || path.join(process.cwd(), 'data', 'settings');
- }
- 
-+// The file's name, and the shared store's key: the same blob under the same name in either place.
-+function settingsKey(username: string, serverUrl: string): string {
-+  return createHash('sha256').update(`${username}:${serverUrl}`).digest('hex');
++
++  // ─── kv ──────────────────────────────────────────────────────────────────
++
++  async function kvGet(key: string): Promise<string | null> {
++    const { rows } = await q<{ value: string }>(`SELECT value FROM ${t('kv')} WHERE key = $1 AND ${LIVE}`, [key]);
++    return rows[0]?.value ?? null;
++  }
++
++  // Insert, or replace a row only when it has expired: "absent" as Redis sees it.
++  const kvInsertIfAbsent = (expires: string) => `INSERT INTO ${t('kv')} (key, value, expires_at) VALUES ($1, $2, ${expires})
++    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at
++    WHERE ${t('kv')}.expires_at IS NOT NULL AND ${t('kv')}.expires_at <= now()`;
++  const ttlExpr = (param: string) => `CASE WHEN ${param}::bigint > 0 THEN now() + ${param}::bigint * interval '1 millisecond' END`;
++
++  const kv: KvStore = {
++    async get(key) {
++      assertKey(key);
++      return kvGet(key);
++    },
++    async set(key, value, opts = {}) {
++      assertKey(key);
++      const ttl = opts.ttlMs && opts.ttlMs > 0 ? Math.ceil(opts.ttlMs) : 0;
++      if (opts.ifAbsent) {
++        const { rowCount } = await q(kvInsertIfAbsent(ttlExpr('$3')), [key, value, ttl]);
++        return rowCount === 1;
++      }
++      await q(`INSERT INTO ${t('kv')} (key, value, expires_at) VALUES ($1, $2, ${ttlExpr('$3')})
++        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, expires_at = EXCLUDED.expires_at`, [key, value, ttl]);
++      return true;
++    },
++    async del(key) {
++      assertKey(key);
++      await q(`DELETE FROM ${t('kv')} WHERE key = $1`, [key]);
++    },
++    async take(key) {
++      assertKey(key);
++      const { rows } = await q<{ value: string; live: boolean }>(
++        `DELETE FROM ${t('kv')} WHERE key = $1 RETURNING value, ${LIVE} AS live`, [key]);
++      return rows[0]?.live ? rows[0].value : null;
++    },
++    async update(key, fn, opts = {}) {
++      assertKey(key);
++      const ttl = opts.ttlMs && opts.ttlMs > 0 ? Math.ceil(opts.ttlMs) : 0;
++      for (let attempt = 0; attempt < 20; attempt++) {
++        const current = await kvGet(key);
++        const next = fn(current);
++        if (next === undefined) return undefined;
++        let ok: boolean;
++        if (next === null) {
++          ok = current === null
++            || (await q(`DELETE FROM ${t('kv')} WHERE key = $1 AND value = $2 AND ${LIVE}`, [key, current])).rowCount === 1;
++        } else if (current === null) {
++          ok = (await q(kvInsertIfAbsent(ttlExpr('$3')), [key, next, ttl])).rowCount === 1;
++        } else {
++          // Without ttlMs the value keeps the expiry it had, as on redis.
++          ok = (await q(`UPDATE ${t('kv')} SET value = $3,
++              expires_at = CASE WHEN $4::bigint > 0 THEN now() + $4::bigint * interval '1 millisecond' ELSE expires_at END
++            WHERE key = $1 AND value = $2 AND ${LIVE}`, [key, current, next, ttl])).rowCount === 1;
++        }
++        if (ok) return next;
++        await backoff(attempt);
++      }
++      // Fail closed like an outage: the callers then answer 503 instead of 500.
++      throw new StoreUnavailableError(`Too many concurrent writes to ${key}`);
++    },
++  };
++
++  // ─── counters ────────────────────────────────────────────────────────────
++
++  const counters: CounterStore = {
++    async reserve(limits, now = Date.now()) {
++      limits.forEach((l) => assertKey(l.key));
++      if (limits.length === 0) return { ok: true, retryAfterMs: 0, counts: [], resetAts: [] };
++      const keys = [...new Set(limits.map((l) => l.key))].sort();
++      return tx(async (client) => {
++        // Rows first, in key order, so two reservations lock them in the same order.
++        await client.query(
++          `INSERT INTO ${t('counters')} (key, n, reset_at) SELECT k, 0, 0 FROM unnest($1::text[]) AS k ORDER BY k ON CONFLICT (key) DO NOTHING`,
++          [keys]);
++        const { rows } = await client.query<{ key: string; n: string; reset_at: string }>(
++          `SELECT key, n, reset_at FROM ${t('counters')} WHERE key = ANY($1::text[]) ORDER BY key FOR UPDATE`, [keys]);
++        const found = new Map(rows.map((r) => [r.key, { n: Number(r.n), r: Number(r.reset_at) }]));
++        const n: number[] = [];
++        const r: number[] = [];
++        let ok = true;
++        let retry = 0;
++        limits.forEach((l, i) => {
++          let { n: ni, r: ri } = found.get(l.key) ?? { n: 0, r: 0 };
++          if (ri <= now) { ni = 0; ri = 0; }
++          n[i] = ni;
++          r[i] = ri;
++          if (Number.isFinite(l.max) && ni >= l.max) {
++            ok = false;
++            retry = Math.max(retry, ri - now);
++          }
++        });
++        if (ok) {
++          for (let i = 0; i < limits.length; i++) {
++            if (r[i] === 0) r[i] = now + Math.ceil(limits[i].windowMs);
++            n[i] += 1;
++            await client.query(`UPDATE ${t('counters')} SET n = $2, reset_at = $3 WHERE key = $1`, [limits[i].key, n[i], r[i]]);
++          }
++        }
++        // Windows over for a minute (the slack Redis keeps them for) go, now and then.
++        if (Math.random() < 0.02) {
++          await client.query(`DELETE FROM ${t('counters')} WHERE reset_at < $1`, [now - 60_000]);
++        }
++        return { ok, retryAfterMs: retry, counts: n, resetAts: r };
++      });
++    },
++    async refund(entries, now = Date.now()) {
++      if (entries.length === 0) return;
++      entries.forEach((e) => assertKey(e.key));
++      for (const e of entries) {
++        await q(`UPDATE ${t('counters')} SET n = n - 1
++          WHERE key = $1 AND reset_at > $2 AND ($3::bigint = 0 OR reset_at = $3::bigint) AND n > 0`, [e.key, now, e.resetAt ?? 0]);
++      }
++    },
++    async hit(key, windowMs, now = Date.now()) {
++      const result = await counters.reserve([{ key, max: Infinity, windowMs }], now);
++      return { count: result.counts[0], resetAt: result.resetAts[0] };
++    },
++    async get(key, now = Date.now()) {
++      assertKey(key);
++      const { rows } = await q<{ n: string; reset_at: string }>(`SELECT n, reset_at FROM ${t('counters')} WHERE key = $1`, [key]);
++      const row = rows[0];
++      if (!row || Number(row.reset_at) <= now) return null;
++      return { count: Number(row.n), resetAt: Number(row.reset_at) };
++    },
++    async reset(key) {
++      assertKey(key);
++      await q(`DELETE FROM ${t('counters')} WHERE key = $1`, [key]);
++    },
++  };
++
++  // ─── documents ───────────────────────────────────────────────────────────
++
++  function collection(name: string, opts: CollectionOptions): DocCollection {
++    assertName(name);
++    // Read-only config comes from the mounted files on every replica.
++    if (opts.configDir && isConfigReadOnly()) return localCollection(name, opts);
++    const ttl = opts.ttlMs && opts.ttlMs > 0 ? Math.ceil(opts.ttlMs) : 0;
++
++    async function get(id: string): Promise<StoredDoc | null> {
++      assertDocId(id);
++      const { rows } = await q<{ data: Buffer; version: string }>(
++        `SELECT data, version FROM ${t('docs')} WHERE coll = $1 AND id = $2 AND ${LIVE}`, [name, id]);
++      return rows[0] ? { data: rows[0].data, version: rows[0].version } : null;
++    }
++
++    async function put(id: string, data: Buffer | string, putOpts: PutOptions = {}): Promise<PutResult> {
++      assertDocId(id);
++      const bytes = toBuffer(data);
++      const version = versionOf(bytes);
++      const params = [name, id, bytes, version, ttl];
++      let rowCount: number | null;
++      if (putOpts.ifVersion === undefined) {
++        ({ rowCount } = await q(`INSERT INTO ${t('docs')} (coll, id, data, version, expires_at) VALUES ($1, $2, $3, $4, ${ttlExpr('$5')})
++          ON CONFLICT (coll, id) DO UPDATE SET data = EXCLUDED.data, version = EXCLUDED.version, expires_at = EXCLUDED.expires_at`, params));
++      } else if (putOpts.ifVersion === null) {
++        ({ rowCount } = await q(`INSERT INTO ${t('docs')} (coll, id, data, version, expires_at) VALUES ($1, $2, $3, $4, ${ttlExpr('$5')})
++          ON CONFLICT (coll, id) DO UPDATE SET data = EXCLUDED.data, version = EXCLUDED.version, expires_at = EXCLUDED.expires_at
++          WHERE ${t('docs')}.expires_at IS NOT NULL AND ${t('docs')}.expires_at <= now()`, params));
++      } else {
++        ({ rowCount } = await q(`UPDATE ${t('docs')} SET data = $3, version = $4, expires_at = ${ttlExpr('$5')}
++          WHERE coll = $1 AND id = $2 AND version = $6 AND ${LIVE}`, [...params, putOpts.ifVersion]));
++      }
++      if (rowCount === 1) return { ok: true, version };
++      return { ok: false, current: await get(id) };
++    }
++
++    async function remove(id: string, putOpts: PutOptions = {}): Promise<boolean> {
++      assertDocId(id);
++      if (putOpts.ifVersion === undefined) {
++        await q(`DELETE FROM ${t('docs')} WHERE coll = $1 AND id = $2`, [name, id]);
++        return true;
++      }
++      if (putOpts.ifVersion === null) {
++        // Only when there is nothing there: then there is nothing to delete but an expired row.
++        if (await get(id)) return false;
++        await q(`DELETE FROM ${t('docs')} WHERE coll = $1 AND id = $2 AND NOT ${LIVE}`, [name, id]);
++        return true;
++      }
++      const { rowCount } = await q(`DELETE FROM ${t('docs')} WHERE coll = $1 AND id = $2 AND version = $3 AND ${LIVE}`,
++        [name, id, putOpts.ifVersion]);
++      return rowCount === 1;
++    }
++
++    return {
++      name,
++      get,
++      put,
++      async update(id, fn, updateOpts = {}) {
++        const retries = updateOpts.maxRetries ?? 10;
++        for (let attempt = 0; attempt <= retries; attempt++) {
++          const current = await get(id);
++          const next = fn(current?.data ?? null);
++          if (next === undefined) return { data: undefined, version: current?.version ?? null };
++          if (next === null) {
++            if (!current) return { data: null, version: null };
++            if (await remove(id, { ifVersion: current.version })) return { data: null, version: null };
++          } else {
++            const result = await put(id, next, { ifVersion: current?.version ?? null });
++            if (result.ok) return { data: toBuffer(next), version: result.version };
++          }
++          await backoff(attempt);
++        }
++        throw new StoreUnavailableError(`Too many concurrent writes to ${name}/${id}`);
++      },
++      delete: remove,
++      async list(listPrefix = '') {
++        if (ttl > 0) await q(`DELETE FROM ${t('docs')} WHERE coll = $1 AND NOT ${LIVE}`, [name]);
++        const { rows } = await q<{ id: string }>(
++          `SELECT id FROM ${t('docs')} WHERE coll = $1 AND left(id, length($2)) = $2 AND ${LIVE}`, [name, listPrefix]);
++        return rows.map((row) => row.id).sort();
++      },
++    };
++  }
++
++  // ─── log ─────────────────────────────────────────────────────────────────
++
++  // One writer's lines land in the order it wrote them, as on one Redis
++  // connection: the pool would otherwise run concurrent appends in any order.
++  const logQueues = new Map<string, Promise<unknown>>();
++  function inOrder<T>(name: string, task: () => Promise<T>): Promise<T> {
++    const run = (logQueues.get(name) ?? Promise.resolve()).catch(() => undefined).then(task);
++    logQueues.set(name, run);
++    return run;
++  }
++
++  function log(name: string, opts: LogOptions): AppendLog {
++    assertName(name);
++    const write = (lines: string[]) => inOrder(name, () => tx(async (client) => {
++      // Per log, across replicas: no other writer's line lands inside a batch.
++      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`${prefix}log:${name}`]);
++      await client.query(`INSERT INTO ${t('logs')} (name, line) SELECT $1, l FROM unnest($2::text[]) WITH ORDINALITY AS u(l, i) ORDER BY i`,
++        [name, lines.map((line) => line.replace(/[\r\n]+/g, ' '))]);
++      await client.query(`DELETE FROM ${t('logs')} WHERE name = $1 AND seq <= (
++        SELECT seq FROM ${t('logs')} WHERE name = $1 ORDER BY seq DESC OFFSET $2 LIMIT 1)`, [name, opts.maxEntries]);
++    }));
++    return {
++      async append(line) {
++        await write([line]);
++      },
++      async appendMany(lines) {
++        if (lines.length === 0) return;
++        await write(lines);
++      },
++      async clear() {
++        await q(`DELETE FROM ${t('logs')} WHERE name = $1`, [name]);
++      },
++      async readAll() {
++        const { rows } = await q<{ line: string }>(`SELECT line FROM ${t('logs')} WHERE name = $1 ORDER BY seq`, [name]);
++        return rows.map((row) => row.line);
++      },
++      async length() {
++        const { rows } = await q<{ n: string }>(`SELECT count(*) AS n FROM ${t('logs')} WHERE name = $1`, [name]);
++        return Number(rows[0]?.n ?? 0);
++      },
++    };
++  }
++
++  // ─── coordination ────────────────────────────────────────────────────────
++
++  const leases: LeaseStore = {
++    async acquire(name, holder, ttlMs) {
++      assertName(name);
++      const { rowCount } = await q(`INSERT INTO ${t('leases')} (name, holder, expires_at)
++          VALUES ($1, $2, now() + $3::bigint * interval '1 millisecond')
++        ON CONFLICT (name) DO UPDATE SET holder = EXCLUDED.holder, expires_at = EXCLUDED.expires_at
++          WHERE ${t('leases')}.holder = EXCLUDED.holder OR ${t('leases')}.expires_at <= now()`, [name, holder, Math.ceil(ttlMs)]);
++      return rowCount === 1;
++    },
++    async release(name, holder) {
++      assertName(name);
++      await q(`DELETE FROM ${t('leases')} WHERE name = $1 AND holder = $2`, [name, holder]);
++    },
++    async holder(name) {
++      assertName(name);
++      const { rows } = await q<{ holder: string }>(`SELECT holder FROM ${t('leases')} WHERE name = $1 AND expires_at > now()`, [name]);
++      return rows[0]?.holder ?? null;
++    },
++  };
++
++  const epochs: EpochStore = {
++    async bump(area) {
++      const { rows } = await q<{ n: string }>(`INSERT INTO ${t('epochs')} (area, n) VALUES ($1, 1)
++        ON CONFLICT (area) DO UPDATE SET n = ${t('epochs')}.n + 1 RETURNING n`, [area]);
++      return Number(rows[0].n);
++    },
++    async all() {
++      const { rows } = await q<{ area: string; n: string }>(`SELECT area, n FROM ${t('epochs')}`);
++      return Object.fromEntries(rows.map((row) => [row.area, Number(row.n)]));
++    },
++  };
++
++  const REPLICA_KEEP_MS = 10 * 60 * 1000;
++  const replicas: ReplicaRegistry = {
++    async beat(info) {
++      const now = Date.now();
++      await q(`INSERT INTO ${t('replicas')} (id, info, last_seen_at) VALUES ($1, $2, $3)
++        ON CONFLICT (id) DO UPDATE SET info = EXCLUDED.info, last_seen_at = EXCLUDED.last_seen_at`,
++        [info.id, JSON.stringify({ ...info, lastSeenAt: now }), now]);
++      await q(`DELETE FROM ${t('replicas')} WHERE last_seen_at < $1`, [now - REPLICA_KEEP_MS]);
++    },
++    async recent(withinMs) {
++      const { rows } = await q<{ info: string }>(`SELECT info FROM ${t('replicas')} WHERE last_seen_at >= $1`, [Date.now() - withinMs]);
++      return rows.flatMap((row) => {
++        try { return [JSON.parse(row.info) as ReplicaInfo]; } catch { return []; }
++      });
++    },
++  };
++
++  const location = `postgres://${process.env.PGUSER ?? ''}@${process.env.PGHOST ?? 'localhost'}/${process.env.PGDATABASE ?? ''}`;
++  let readyPromise: Promise<void> | null = null;
++
++  return {
++    mode: 'postgres',
++    kv,
++    counters,
++    collection,
++    log,
++    leases,
++    epochs,
++    replicas,
++    async ping(timeoutMs = 1000) {
++      let timer: NodeJS.Timeout | undefined;
++      try {
++        await Promise.race([
++          q('SELECT 1'),
++          new Promise<never>((_, reject) => {
++            timer = setTimeout(() => reject(new StoreUnavailableError('The shared store did not answer in time')), timeoutMs);
++          }),
++        ]);
++      } finally {
++        if (timer) clearTimeout(timer);
++      }
++    },
++    status() {
++      return { mode: 'postgres', location, connected };
++    },
++    ready() {
++      // Resolves once the schema is in place; until then it keeps trying, as a
++      // Redis client keeps reconnecting.
++      readyPromise ??= (async () => {
++        for (let attempt = 0; ; attempt++) {
++          try {
++            await ensureSchema();
++            connected = true;
++            return;
++          } catch {
++            await new Promise((resolve) => setTimeout(resolve, Math.min(250 * (attempt + 1), 2000)));
++          }
++        }
++      })();
++      return readyPromise;
++    },
++    async close() {
++      await pool.end();
++    },
++  };
 +}
 +
- function getSettingsPath(username: string, serverUrl: string): string {
--  const hash = createHash('sha256').update(`${username}:${serverUrl}`).digest('hex');
--  const filePath = path.join(getSettingsDir(), `${hash}.enc`);
-+  const filePath = path.join(getSettingsDir(), `${settingsKey(username, serverUrl)}.enc`);
-   // Defense in depth: ensure path stays within the settings directory
-   const resolvedDir = path.resolve(getSettingsDir());
-   const resolvedPath = path.resolve(filePath);
-@@ -32,8 +37,9 @@ function getSettingsPath(username: string, serverUrl: string): string {
- }
++function backoff(attempt: number): Promise<void> {
++  const ms = Math.min(5 + attempt * 10, 100) * (0.5 + Math.random());
++  return new Promise((resolve) => setTimeout(resolve, ms));
++}
+diff --git a/lib/shared-store/types.ts b/lib/shared-store/types.ts
+index 269e9c736..bc458a330 100644
+--- a/lib/shared-store/types.ts
++++ b/lib/shared-store/types.ts
+@@ -13,7 +13,8 @@
+  * (StoreUnavailableError).
+  */
  
- export async function saveUserSettings(username: string, serverUrl: string, settings: Record<string, unknown>): Promise<void> {
-+  const shared = sharedStoreEnabled();
-   const dir = getSettingsDir();
--  if (!existsSync(dir)) {
-+  if (!shared && !existsSync(dir)) {
-     await mkdir(dir, { recursive: true });
-   }
+-export type StoreMode = 'local' | 'redis';
++// 'postgres': MainThrive patch 0016 (lib/shared-store/postgres.ts).
++export type StoreMode = 'local' | 'redis' | 'postgres';
  
-@@ -46,6 +52,7 @@ export async function saveUserSettings(username: string, serverUrl: string, sett
-   const tag = cipher.getAuthTag();
- 
-   const data = Buffer.concat([iv, tag, encrypted]);
-+  if (shared) return putSettingsBlob(settingsKey(username, serverUrl), data);
-   const targetPath = getSettingsPath(username, serverUrl);
-   const tmpPath = targetPath + '.tmp';
-   await writeFile(tmpPath, data);
-@@ -53,10 +60,13 @@ export async function saveUserSettings(username: string, serverUrl: string, sett
- }
- 
- export async function loadUserSettings(username: string, serverUrl: string): Promise<Record<string, unknown> | null> {
-+  // Outside the try: a shared store that cannot be read throws, so the caller answers an error, not "no settings".
-+  const stored = sharedStoreEnabled() ? await getSettingsBlob(settingsKey(username, serverUrl)) : undefined;
-+  if (stored === null) return null;
-   const filePath = getSettingsPath(username, serverUrl);
- 
-   try {
--    const data = await readFile(filePath);
-+    const data = stored ?? await readFile(filePath);
-     if (data.length < IV_LENGTH + TAG_LENGTH) return null;
- 
-     const key = getKey();
-@@ -77,6 +87,7 @@ export async function loadUserSettings(username: string, serverUrl: string): Pro
- }
- 
- export async function deleteUserSettings(username: string, serverUrl: string): Promise<void> {
-+  if (sharedStoreEnabled()) return deleteSettingsBlob(settingsKey(username, serverUrl));
-   try {
-     await unlink(getSettingsPath(username, serverUrl));
-   } catch (error) {
+ /** The shared store could not be reached or didn't answer in time. */
+ export class StoreUnavailableError extends Error {
 diff --git a/package-lock.json b/package-lock.json
-index 6efc7f0..c8faf13 100644
+index fb2710956..b50749f27 100644
 --- a/package-lock.json
 +++ b/package-lock.json
-@@ -40,6 +40,7 @@
+@@ -50,6 +50,7 @@
          "next-intl": "^4.13.3",
-         "otpauth": "^9.5.0",
-         "pdfjs-dist": "^6.0.227",
+         "otpauth": "^9.5.2",
+         "pdfjs-dist": "^6.4.299",
 +        "pg": "8.23.1",
-         "postal-mime": "^2.7.4",
+         "postal-mime": "^4.1.4",
+         "pst-extractor": "1.12.0",
          "qrcode": "^1.5.4",
-         "react": "^19.2.5",
-@@ -57,6 +58,7 @@
-         "@testing-library/jest-dom": "^6.9.1",
-         "@testing-library/react": "^16.3.1",
-         "@types/node": "^25.6.0",
+@@ -69,6 +70,7 @@
+         "@testing-library/jest-dom": "^7.0.1",
+         "@testing-library/react": "^16.3.3",
+         "@types/node": "^25.9.9",
 +        "@types/pg": "8.23.1",
          "@types/qrcode": "^1.5.6",
-         "@types/react": "^19.2.7",
-         "@types/react-dom": "^19.2.3",
-@@ -4221,6 +4223,18 @@
-         "undici-types": "~7.19.0"
+         "@types/react": "^19.3.0",
+         "@types/react-dom": "^19.3.0",
+@@ -4662,6 +4664,18 @@
+         "undici-types": ">=7.24.0 <7.24.7"
        }
      },
 +    "node_modules/@types/pg": {
@@ -676,8 +861,8 @@ index 6efc7f0..c8faf13 100644
      "node_modules/@types/qrcode": {
        "version": "1.5.6",
        "resolved": "https://registry.npmjs.org/@types/qrcode/-/qrcode-1.5.6.tgz",
-@@ -8234,6 +8248,95 @@
-         "@napi-rs/canvas": "^1.0.0"
+@@ -8717,6 +8731,95 @@
+         "@napi-rs/canvas": "^1.0.10"
        }
      },
 +    "node_modules/pg": {
@@ -772,7 +957,7 @@ index 6efc7f0..c8faf13 100644
      "node_modules/picocolors": {
        "version": "1.1.1",
        "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
-@@ -8343,6 +8446,45 @@
+@@ -8826,6 +8929,45 @@
          "node": "^10 || ^12 || >=14"
        }
      },
@@ -818,7 +1003,7 @@ index 6efc7f0..c8faf13 100644
      "node_modules/prelude-ls": {
        "version": "1.2.1",
        "resolved": "https://registry.npmjs.org/prelude-ls/-/prelude-ls-1.2.1.tgz",
-@@ -9093,6 +9235,15 @@
+@@ -9621,6 +9763,15 @@
          "node": ">=0.10.0"
        }
      },
@@ -831,10 +1016,10 @@ index 6efc7f0..c8faf13 100644
 +        "node": ">= 10.x"
 +      }
 +    },
-     "node_modules/stackback": {
-       "version": "0.0.2",
-       "resolved": "https://registry.npmjs.org/stackback/-/stackback-0.0.2.tgz",
-@@ -10137,6 +10288,15 @@
+     "node_modules/standard-as-callback": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/standard-as-callback/-/standard-as-callback-2.1.0.tgz",
+@@ -10985,6 +11136,15 @@
        "dev": true,
        "license": "MIT"
      },
@@ -851,22 +1036,22 @@ index 6efc7f0..c8faf13 100644
        "version": "4.0.3",
        "resolved": "https://registry.npmjs.org/y18n/-/y18n-4.0.3.tgz",
 diff --git a/package.json b/package.json
-index ef7d04a..6117543 100644
+index f265b808b..f4fefc4bb 100644
 --- a/package.json
 +++ b/package.json
-@@ -68,6 +68,7 @@
+@@ -82,6 +82,7 @@
      "next-intl": "^4.13.3",
-     "otpauth": "^9.5.0",
-     "pdfjs-dist": "^6.0.227",
+     "otpauth": "^9.5.2",
+     "pdfjs-dist": "^6.4.299",
 +    "pg": "8.23.1",
-     "postal-mime": "^2.7.4",
+     "postal-mime": "^4.1.4",
+     "pst-extractor": "1.12.0",
      "qrcode": "^1.5.4",
-     "react": "^19.2.5",
-@@ -85,6 +86,7 @@
-     "@testing-library/jest-dom": "^6.9.1",
-     "@testing-library/react": "^16.3.1",
-     "@types/node": "^25.6.0",
+@@ -101,6 +102,7 @@
+     "@testing-library/jest-dom": "^7.0.1",
+     "@testing-library/react": "^16.3.3",
+     "@types/node": "^25.9.9",
 +    "@types/pg": "8.23.1",
      "@types/qrcode": "^1.5.6",
-     "@types/react": "^19.2.7",
-     "@types/react-dom": "^19.2.3",
+     "@types/react": "^19.3.0",
+     "@types/react-dom": "^19.3.0",

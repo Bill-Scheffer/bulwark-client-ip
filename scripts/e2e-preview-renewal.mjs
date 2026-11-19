@@ -1,14 +1,19 @@
-// End-to-end: a push preview still names the message after the session's access token expired.
-// Runs against the built image and a real Stalwart whose access tokens last 20 s. A real password
-// sign-in through the image, the context sync the app makes, then previews across two expiries.
+// End-to-end: a push preview still names the message after the session's access token expired, and after
+// the browser restarted. Runs against the built image and a real Stalwart whose access tokens last 70 s.
+// A real password sign-in through the image, the context sync the app makes, then previews across two
+// expiries (upstream #1509 since 1.21; patch 0003 before), an OAuth sign-in whose browser restarted (patch
+// 0007) and a remembered one (upstream since 1.21; patch 0006 before).
 // Usage: node e2e-preview-renewal.mjs <bulwark url> <stalwart internal url> <JMAP_SERVER_URL> <user> <password> <expect>
-// <expect> is "renews" for the patched image, "401" for the negative control (the image before the patch).
+// <expect> is "renews" for the patched image, "no-0007" for the negative control: the same image without 0007,
+// which must lose the preview of an OAuth sign-in whose browser restarted, and only that.
 const [BW, ST, SERVER, USER, PASS, EXPECT] = process.argv.slice(2);
 const SUBJECT = 'e2e preview after expiry';
 const fail = (msg) => { console.error(`::error::${msg}`); process.exit(1); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// A cookie jar that keeps names and values only, as the browser would send them back.
+// A cookie jar that keeps what the browser sends back, and whether each cookie outlives the browser session
+// (a Max-Age or an Expires), which is what a browser killed in the background still has when it restarts.
+const persistent = new Map();
 function applySetCookies(jar, res) {
   for (const line of res.headers.getSetCookie()) {
     const [pair, ...attrs] = line.split(';');
@@ -16,9 +21,12 @@ function applySetCookies(jar, res) {
     const name = pair.slice(0, eq).trim();
     const value = pair.slice(eq + 1).trim();
     const expired = attrs.some((a) => /^\s*max-age=0\s*$/i.test(a) || /^\s*expires=thu, 01 jan 1970/i.test(a));
-    if (expired || value === '') jar.delete(name); else jar.set(name, value);
+    if (expired || value === '') { jar.delete(name); persistent.delete(name); continue; }
+    jar.set(name, value);
+    persistent.set(name, attrs.some((a) => /^\s*(max-age=[1-9]|expires=)/i.test(a)));
   }
 }
+const afterRestart = (jar) => new Map([...jar].filter(([k]) => persistent.get(k)));
 const cookieHeader = (jar) => [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
 const setCookieNames = (res) => res.headers.getSetCookie().map((l) => l.split('=')[0]);
 
@@ -49,7 +57,7 @@ const tokens = await login.json();
 if (login.status !== 200 || !tokens.access_token) fail(`sign-in answered ${login.status}`);
 if (!jar.has('jmap_rt')) fail('sign-in set no refresh token cookie');
 console.log(`signed in; token lasts ${tokens.expires_in}s; cookies: ${[...jar.keys()].join(', ')}`);
-if (tokens.expires_in > 60) fail(`the access token lasts ${tokens.expires_in}s; the server's lifetime was not shortened`);
+if (tokens.expires_in > 120) fail(`the access token lasts ${tokens.expires_in}s; the server's lifetime was not shortened`);
 
 // 2. The app syncs its bearer into the server-side context the preview reads.
 const bearer = `Bearer ${tokens.access_token}`;
@@ -102,19 +110,13 @@ r = await getPreview('expired, no refresh token', bare, { update: false });
 if (r.status !== 401) fail(`expected 401 without a refresh token, got ${r.status}`);
 if (r.names.length) fail(`a failed renewal changed cookies: ${r.names.join(', ')}`);
 
-if (EXPECT === '401') {
-  r = await getPreview('expired token, image before the patch', jar);
-  if (r.status !== 401) fail(`expected the unpatched image to answer 401, got ${r.status}`);
-  console.log('negative control: OK (the image before the patch loses the preview after expiry)');
-  process.exit(0);
-}
-
 // 5. Expired: two previews at once, as one delivery produces. Both must name the message.
 const [a, b] = await Promise.all([getPreview('expired, preview A', jar, { update: false }), getPreview('expired, preview B', jar, { update: false })]);
 for (const x of [a, b]) {
   if (x.status !== 200 || x.body.email?.subject !== SUBJECT) fail('a preview after expiry did not name the message');
 }
-if (!a.names.includes('jmap_stalwart_ctx') && !b.names.includes('jmap_stalwart_ctx')) fail('the renewed session was not stored');
+// Upstream keeps the renewed token in the access-token cookie, which the next preview and the page read.
+if (!a.names.includes('jmap_at') && !b.names.includes('jmap_at')) fail('the renewed token was not stored');
 // Keep what the browser would: the answer that stored the renewal.
 const stored = await getPreview('expired, stored', jar);
 if (stored.status !== 200) fail('the preview failed after the renewal');
@@ -123,13 +125,19 @@ if (stored.status !== 200) fail('the preview failed after the renewal');
 await expire();
 r = await getPreview('second expiry', jar);
 if (r.status !== 200 || r.body.email?.subject !== SUBJECT) fail('the preview failed after a second expiry');
-if (!r.names.includes('jmap_stalwart_ctx')) fail('the second expiry did not renew; the check measured nothing');
+if (!r.names.includes('jmap_at')) fail('the second expiry did not renew; the check measured nothing');
 
 // 7. An OAuth sign-in (a TOTP account's) keeps only its 30-day refresh token when a push wakes a phone
 // whose browser was killed: no context, no cached token. The preview must rebuild the context from it.
-const refreshOnly = new Map([...jar].filter(([k]) => k.startsWith('jmap_rt')));
+const refreshOnly = afterRestart(jar);
 console.log(`OAuth sign-in; the restarted browser sends: ${[...refreshOnly.keys()].join(', ')}`);
+if (!refreshOnly.has('jmap_rt') || refreshOnly.has('jmap_stalwart_ctx')) fail('the restart model is wrong: the refresh token must outlive it, the context must not');
 r = await getPreview('OAuth sign-in, context dropped', refreshOnly);
+if (EXPECT === 'no-0007') {
+  if (r.status !== 401) fail(`expected the image without 0007 to lose this preview (401), got ${r.status}`);
+  console.log('negative control: OK (without 0007 the restarted OAuth sign-in gets the generic notification)');
+  process.exit(0);
+}
 if (r.status !== 200 || r.body.email?.subject !== SUBJECT) fail('the preview did not rebuild a dropped OAuth context from the refresh token');
 if (!r.names.includes('jmap_stalwart_ctx')) fail('the rebuilt OAuth context was not stored');
 
@@ -141,10 +149,11 @@ const rs = await bw(remembered, '/api/auth/session', {
 });
 applySetCookies(remembered, rs);
 if (rs.status !== 200 || !remembered.has('jmap_session')) fail(`remembered sign-in answered ${rs.status}`);
-remembered.delete('jmap_stalwart_ctx');
-console.log(`remembered sign-in; the restarted browser sends: ${[...remembered.keys()].join(', ')}`);
-r = await getPreview('remembered sign-in, context dropped', remembered);
+const rememberedAfter = afterRestart(remembered);
+console.log(`remembered sign-in; the restarted browser sends: ${[...rememberedAfter.keys()].join(', ')}`);
+if (rememberedAfter.has('jmap_stalwart_ctx')) fail('the restart model is wrong: the context must not outlive it');
+r = await getPreview('remembered sign-in, context dropped', rememberedAfter);
+// Upstream rebuilds it for this request from the remembered sign-in (readPushAuthContext) and stores nothing.
 if (r.status !== 200 || r.body.email?.subject !== SUBJECT) fail('the preview did not rebuild a dropped context from the remembered sign-in');
-if (!r.names.includes('jmap_stalwart_ctx')) fail('the rebuilt context was not stored');
 
 console.log('preview renewal: OK');

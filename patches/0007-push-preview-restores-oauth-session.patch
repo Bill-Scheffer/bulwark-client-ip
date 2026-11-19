@@ -1,155 +1,139 @@
 diff --git a/app/api/push/preview/route.ts b/app/api/push/preview/route.ts
-index 9989f69..bb2f0d4 100644
+index 92e9d437c..7109482b1 100644
 --- a/app/api/push/preview/route.ts
 +++ b/app/api/push/preview/route.ts
-@@ -13,6 +13,7 @@ import {
-   storeRefreshedTokens,
-   type RefreshedTokens,
- } from '@/lib/oauth/refresh-slot';
-+import { getRequiredConfig, DEFAULT_CLIENT_ID } from '@/lib/oauth/token-exchange';
+@@ -4,7 +4,9 @@ import { logger } from '@/lib/logger';
+ import { cleanPreview } from '@/lib/utils';
+ import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
+ import { readPushAuthContext } from '@/lib/stalwart/push-auth-context';
+-import { renewPushAuthHeader } from '@/lib/stalwart/push-token-renewal';
++import { renewPushAuthHeader, restorePushContextFromRefreshToken } from '@/lib/stalwart/push-token-renewal';
++import { readSignInStamp } from '@/lib/auth/session-age';
++import { refreshTokenCookieName } from '@/lib/oauth/tokens';
+ import type { StalwartAuthContext } from '@/lib/stalwart/auth-context';
  import {
    getStalwartCredentials,
-   type StalwartCredentials,
-@@ -77,8 +78,17 @@ async function resolveTargetForAccount(
-     // remembered sign-in but not the context; rebuild it, as the app does.
-     const ctx = readStalwartAuthContextFromStore(cookieStore, slot)
-       ?? restoreStalwartAuthContextFromSession(cookieStore, slot);
--    if (!ctx) continue;
--    const serverUrl = ctx.serverUrl.replace(/\/+$/, '');
-+    // An OAuth sign-in (a TOTP account's, say) keeps only its 30-day refresh
-+    // token across such a restart; the context is rebuilt from it below.
-+    const refreshServerId = ctx ? null : readRefreshToken(cookieStore, slot)?.serverId;
-+    if (!ctx && refreshServerId === undefined) continue;
-+    let serverUrl: string;
-+    try {
-+      serverUrl = (ctx?.serverUrl ?? getRequiredConfig(refreshServerId, { fallbackClientId: DEFAULT_CLIENT_ID }).serverUrl)
-+        .replace(/\/+$/, '');
-+    } catch {
-+      continue;
-+    }
-     probes.push(
-       (async () => {
-         try {
-@@ -86,13 +96,15 @@ async function resolveTargetForAccount(
-           const probe = (authHeader: string) => fetchJmapServer(`${serverUrl}/.well-known/jmap`, {
-             headers: { Authorization: authHeader },
-           }, trusted);
--          let authHeader = ctx.authHeader;
--          let res = await probe(authHeader);
--          // Only an OAuth session renews; a Basic credential does not expire.
--          if (res.status === 401 && authHeader.startsWith('Bearer ')) {
--            const renewed = await renewBearer(cookieStore, slot);
--            if (!renewed) return null;
--            authHeader = `Bearer ${renewed.access_token}`;
-+          let authHeader = ctx?.authHeader ?? '';
-+          let res = ctx ? await probe(authHeader) : null;
-+          let renewed = false;
-+          // Renew an expired OAuth token, or a context that is gone. A Basic
-+          // credential does not expire.
-+          if (!res || (res.status === 401 && authHeader.startsWith('Bearer '))) {
-+            const tokens = await renewBearer(cookieStore, slot);
-+            if (!tokens) return null;
-+            authHeader = `Bearer ${tokens.access_token}`;
-             res = await probe(authHeader);
-             if (!res.ok) {
-               logger.warn('push preview renewed a session token the server then refused', { slot, status: res.status });
-@@ -100,8 +112,8 @@ async function resolveTargetForAccount(
-             }
-             // Stored only once the new token has worked, so the open app
-             // resumes with it and the next preview needs no refresh.
--            storeRefreshedTokens(cookieStore, slot, renewed, basePath);
--            setStalwartAuthContextInStore(cookieStore, slot, { ...ctx, authHeader });
-+            storeRefreshedTokens(cookieStore, slot, tokens, basePath);
-+            renewed = true;
-           }
-           if (!res.ok) {
-             logger.warn('push preview could not open the session', {
-@@ -113,9 +125,16 @@ async function resolveTargetForAccount(
-           }
-           const session = (await res.json()) as {
-             apiUrl?: string;
-+            username?: string;
-             primaryAccounts?: Record<string, string>;
-             accounts?: Record<string, unknown>;
-           };
-+          if (renewed) {
-+            const username = ctx?.username ?? session.username;
-+            if (username) {
-+              setStalwartAuthContextInStore(cookieStore, slot, ctx ? { ...ctx, authHeader } : { serverUrl, username, authHeader });
-+            }
-+          }
-           const mailAccountId = session.primaryAccounts?.['urn:ietf:params:jmap:mail'];
-           if (!session.apiUrl || !mailAccountId) return null;
-           // Shared and group mailboxes are never the primary mail account -
-diff --git a/lib/__tests__/push-preview-route.test.ts b/lib/__tests__/push-preview-route.test.ts
-index 2b5c4aa..1861361 100644
---- a/lib/__tests__/push-preview-route.test.ts
-+++ b/lib/__tests__/push-preview-route.test.ts
-@@ -56,6 +56,11 @@ vi.mock('@/lib/stalwart/server-fetch', () => ({
-   isTrustedJmapServerUrl: async () => true,
- }));
+@@ -95,9 +97,26 @@ async function openSession(
+ async function resolveTargetForAccount(accountId: string, login: string | null, forwarded: Record<string, string>, basePath: string | undefined): Promise<ResolvedTarget | 'ambiguous' | null> {
+   const cookieStore = await cookies();
+   const contexts: { slot: number; ctx: StalwartAuthContext }[] = [];
++  const tokenOnly: number[] = [];
+   for (let slot = 0; slot < MAX_ACCOUNT_SLOTS; slot++) {
+     const ctx = await readPushAuthContext(cookieStore, slot);
+     if (ctx) contexts.push({ slot, ctx });
++    else if (cookieStore.get(refreshTokenCookieName(slot))?.value) tokenOnly.push(slot);
++  }
++  // MainThrive (patch 0007): a token sign-in whose browser restarted keeps only
++  // its refresh token. Rebuilt for one login at most, for the reason renewing
++  // is limited below: the one the push names (by the account its sign-in stamp
++  // records), or the only login there is.
++  const restoreSlot = login
++    ? tokenOnly.find((slot) => {
++      const refreshToken = cookieStore.get(refreshTokenCookieName(slot))?.value ?? '';
++      return readSignInStamp(cookieStore, slot, refreshToken)?.account?.toLowerCase() === login.toLowerCase();
++    })
++    : (contexts.length === 0 && tokenOnly.length === 1 ? tokenOnly[0] : undefined);
++  if (restoreSlot !== undefined) {
++    const ctx = await restorePushContextFromRefreshToken(cookieStore, restoreSlot, basePath, async (serverUrl, authHeader) =>
++      fetchJmapServer(`${serverUrl}/.well-known/jmap`, { headers: { Authorization: authHeader, ...forwarded } }, await isTrustedJmapServerUrl(serverUrl)));
++    if (ctx) contexts.push({ slot: restoreSlot, ctx });
+   }
+   // Renewing writes a slot's rotated tokens into this answer. Every expired
+   // login at once could outgrow a proxy's header buffer, and an answer lost
+diff --git a/lib/stalwart/push-token-renewal.ts b/lib/stalwart/push-token-renewal.ts
+index 95579ad62..e0cc636dc 100644
+--- a/lib/stalwart/push-token-renewal.ts
++++ b/lib/stalwart/push-token-renewal.ts
+@@ -4,7 +4,8 @@ import { isPastMaxAge, maxSessionHoursFor, tokenSignedInAt } from '@/lib/auth/se
+ import { IS_DESKTOP_BUILD } from '@/lib/desktop/flag';
+ import { redeemRefreshToken, refreshTokenServer, storeRenewedTokens, wasSignedOut } from '@/lib/oauth/slot-renewal';
+ import { accessTokenCookieName, decodeCachedAccessToken, refreshTokenCookieName } from '@/lib/oauth/tokens';
+-import type { StalwartAuthContext } from '@/lib/stalwart/auth-context';
++import { setStalwartAuthContextInStore, type StalwartAuthContext } from '@/lib/stalwart/auth-context';
++import { UPSTREAM_JSON_MAX_BYTES, readJsonCapped } from '@/lib/security/capped-body';
+ import { limitsOnlyAPageEnforces } from '@/lib/stalwart/push-auth-context';
  
-+vi.mock('@/lib/oauth/token-exchange', () => ({
-+  getRequiredConfig: () => ({ serverUrl: 'https://mail.example.com/' }),
-+  DEFAULT_CLIENT_ID: 'bulwark-webmail',
-+}));
+ type CookieStore = Awaited<ReturnType<typeof cookies>>;
+@@ -77,3 +78,82 @@ export async function renewPushAuthHeader(
+   );
+   return `Bearer ${accessToken}`;
+ }
 +
- vi.mock('@/lib/security/url-guard', () => ({
-   DisallowedUrlError: class DisallowedUrlError extends Error {},
- }));
-@@ -66,6 +71,7 @@ function jsonResponse(data: unknown) {
- 
- const SESSION = {
-   apiUrl: 'https://mail.example.com/jmap',
-+  username: 'me@example.com',
-   primaryAccounts: { 'urn:ietf:params:jmap:mail': 'a' },
-   accounts: { a: { name: 'me@example.com' }, g: { name: 'group@example.com' } },
- };
-@@ -152,7 +158,9 @@ describe('push preview route after the session token expired', () => {
-     hasContext = true;
-     restored = null;
-     mockJmap('Bearer fresh');
--    readRefreshToken.mockReturnValue({ refreshToken: 'rt1', serverId: null });
-+    // One signed-in slot, as a real cookie store has: slot 1 holds nothing.
-+    readRefreshToken.mockImplementation((_store: unknown, slot: number) =>
-+      slot === 0 ? { refreshToken: 'rt1', serverId: null } : null);
-     requestTokenRefresh.mockResolvedValue({ ok: true, tokens: RENEWED });
-   });
- 
-@@ -232,8 +240,26 @@ describe('push preview route after the session token expired', () => {
-     expect(requestTokenRefresh).not.toHaveBeenCalled();
-   });
- 
-+  it('rebuilds a lost OAuth context from the refresh token alone', async () => {
-+    // A TOTP account signs in with OAuth; after a background browser restart
-+    // only its 30-day refresh token comes back.
-+    hasContext = false;
-+    const { status, body } = await callRoute('a');
-+
-+    expect(status).toBe(200);
-+    expect(body.email).toMatchObject({ id: 'e1', subject: 'Hi' });
-+    expect(requestTokenRefresh).toHaveBeenCalledWith('rt1', null);
-+    expect(storeRefreshedTokens).toHaveBeenCalledWith(cookieStore, 0, RENEWED, undefined);
-+    expect(setStalwartAuthContextInStore).toHaveBeenCalledWith(cookieStore, 0, {
-+      serverUrl: 'https://mail.example.com',
-+      username: 'me@example.com',
-+      authHeader: 'Bearer fresh',
++/**
++ * MainThrive (patch 0007): a token sign-in's context, rebuilt from its refresh
++ * token when the browser lost it. A password plus two-step sign-in runs on
++ * tokens; its refresh token, sign-in stamp and server cookie outlive a browser
++ * restart, but the context cookie ends with the browser session. A push that
++ * wakes a phone whose browser was killed in the background therefore finds no
++ * context, and readPushAuthContext rebuilds only a remembered Basic sign-in, so
++ * every notification after such a restart read "You have new mail".
++ *
++ * The same rules as renewPushAuthHeader decide whether it may renew here, and
++ * the same exchange renews. The rotated tokens are kept at once (the old refresh
++ * token is spent), and the context only once the session opened with the new
++ * token, which also names the account. Null, and a warning naming the reason
++ * (never a value), when it can't.
++ */
++export async function restorePushContextFromRefreshToken(
++  cookieStore: CookieStore,
++  slot: number,
++  basePath: string | undefined,
++  openSession: (serverUrl: string, authHeader: string) => Promise<Response>,
++): Promise<StalwartAuthContext | null> {
++  if (IS_DESKTOP_BUILD) return null;
++  const refreshToken = cookieStore.get(refreshTokenCookieName(slot))?.value;
++  if (!refreshToken) return null;
++  const why = (reason: string, extra: Record<string, unknown> = {}) => {
++    logger.warn('push preview could not rebuild a token sign-in', { slot, reason, ...extra });
++    return null;
++  };
++  const age = await tokenSignedInAt(cookieStore, slot, refreshToken);
++  const remember = age?.stamp?.remember;
++  if (!age || remember === undefined) return why('no readable sign-in stamp');
++  const maxHours = await maxSessionHoursFor(age.stamp?.account);
++  if (isPastMaxAge(age.signedInAt, maxHours)) return why('past the maximum session length');
++  if (await limitsOnlyAPageEnforces()) return why('limits only a page enforces');
++  const bound = await refreshTokenServer(cookieStore, slot, refreshToken);
++  if (!bound) return why('the issuing server cannot be told');
++  // Loaded here, on the one path that needs it: the route's other paths never do.
++  const { DEFAULT_CLIENT_ID, getRequiredConfig } = await import('@/lib/oauth/token-exchange');
++  let serverUrl: string;
++  try {
++    serverUrl = getRequiredConfig(bound.serverId, bound.upstream ? { upstream: bound.upstream } : { fallbackClientId: DEFAULT_CLIENT_ID })
++      .serverUrl.replace(/\/+$/, '');
++  } catch {
++    return why('no server address for the token');
++  }
++  const redemption = await redeemRefreshToken(refreshToken, bound.serverId, bound.upstream);
++  if (redemption.kind !== 'issued' || !redemption.tokens.access_token) {
++    return why('renewal failed', {
++      ...(redemption.kind === 'refused' ? { status: redemption.status } : {}),
++      ...(redemption.kind === 'unreachable' ? { error: redemption.message } : {}),
 +    });
-+  });
-+
-   it('says which cookies arrived when no session context did, by name only', async () => {
-     hasContext = false;
-+    readRefreshToken.mockReturnValue(null);
-     const { status } = await callRoute('a');
- 
-     expect(status).toBe(401);
-@@ -246,7 +272,8 @@ describe('push preview route after the session token expired', () => {
-     const { status } = await callRoute('a');
- 
-     expect(status).toBe(401);
--    expect(readRefreshToken).not.toHaveBeenCalled();
-+    // The Basic slot never looks for a refresh token (the empty slot 1 may).
-+    expect(readRefreshToken).not.toHaveBeenCalledWith(cookieStore, 0);
-     expect(requestTokenRefresh).not.toHaveBeenCalled();
-   });
- 
++  }
++  if (wasSignedOut(refreshToken)) return null;
++  const { accessToken } = storeRenewedTokens(
++    cookieStore,
++    slot,
++    { ...redemption.tokens, access_token: redemption.tokens.access_token },
++    { remember, age, basePath, server: bound },
++  );
++  const authHeader = `Bearer ${accessToken}`;
++  const res = await openSession(serverUrl, authHeader);
++  if (!res.ok) return why('the renewed token could not open the session', { status: res.status });
++  let username: unknown;
++  try {
++    username = ((await readJsonCapped(res, UPSTREAM_JSON_MAX_BYTES)) as { username?: unknown }).username;
++  } catch {
++    return why('the session could not be read');
++  }
++  if (typeof username !== 'string' || !username) return why('the session names no account');
++  const context: StalwartAuthContext = {
++    serverUrl,
++    username,
++    authHeader,
++    ...(age.stamp?.account && age.stamp.account !== username ? { accountName: age.stamp.account } : {}),
++  };
++  setStalwartAuthContextInStore(cookieStore, slot, context);
++  return context;
++}

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end for 0003: a push preview still names the message after the session's access token
-# expired. A real Stalwart (access tokens shortened to 20 s) and the BUILT image; the client side is
+# End-to-end for push previews (upstream #1509, and 0007): a push preview still names the message after the session's access token
+# expired. A real Stalwart (access tokens shortened to 70 s) and the BUILT image; the client side is
 # e2e-preview-renewal.mjs. Throwaway containers and credentials, removed on exit.
-# Usage: e2e-preview-renewal.sh <image> [renews|401]   (401: the negative control, an image without 0003)
+# Usage: e2e-preview-renewal.sh <image> [renews|no-0007]   (no-0007: the negative control, the image without 0007)
 set -euo pipefail
 IMAGE="$1"
 EXPECT="${2:-renews}"
@@ -37,7 +37,10 @@ stalwart_ready() {
   echo "::error::Stalwart did not become ready"; exit 1
 }
 stalwart_ready
-cli update OidcProvider singleton --field accessTokenExpiry=20000
+# 70 s: longer than upstream's REDEMPTION_KEPT_MS (60 s, lib/oauth/slot-renewal.ts), which hands a renewal to every
+# request still carrying the refresh token it spent. With 20 s tokens the second expiry got the first renewal's
+# token, already expired; production's last an hour.
+cli update OidcProvider singleton --field accessTokenExpiry=70000
 # The token lifetime takes effect only after a restart.
 docker restart e2e-rn-stalwart >/dev/null
 stalwart_ready

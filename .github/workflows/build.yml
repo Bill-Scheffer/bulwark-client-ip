@@ -1,64 +1,29 @@
-# Builds Bulwark from its own release source with sixteen patches:
+# Builds Bulwark from its own release source with eight patches. Nine earlier ones (0003, 0006, 0008-0014) were
+# retired at 1.21.2 because upstream now does what each did (README, "Retired patches"; MainThrive MAI-1442).
 #   0001-forward-client-ip-to-jmap.patch: server-side requests to the configured JMAP server can go to
 #     a private URL and carry the visitor's IP (opt-in: JMAP_SERVER_INTERNAL_URL,
 #     JMAP_FORWARD_CLIENT_IP). Without it, every visitor's wrong password counts against the webmail
 #     server's own address at the JMAP server, and one attacker can get that address banned, locking
-#     every user out.
+#     every user out. Upstream forwards the address on some routes since 1.16, but sends nothing when it
+#     has none, so the server falls back to this pod's own address; 0001 sends 192.0.2.1 instead.
 #   0002-push-relay-build-arg.patch: a build argument for the default push relay
 #     (NEXT_PUBLIC_PUSH_RELAY_URL), which upstream reads at build time but its Dockerfile never passes.
 #     This build sets it to PUSH_RELAY_URL below, so the client never contacts the hosted relay.
-#   0003-push-preview-renews-expired-session.patch: the push preview renews an expired OAuth access
-#     token with the session's refresh token, as the open app does, so a notification still names the
-#     sender and subject when the app has not been open for an hour. Without it, every notification
-#     after the token's lifetime reads "You have new mail".
 #   0004-notification-badge.patch: the notification badge (Android's status-bar icon) can have its own
-#     image (PWA_BADGE_URL). Android draws the badge from its alpha channel alone, so an opaque PWA icon
-#     is a solid square there; the icon itself stays opaque, because it is also the maskable icon.
-#   0005-push-preview-says-why.patch: the push preview logs a warning on each path that answers 401
-#     (never a value; the no-session case names which cookies arrived), so a generic notification
-#     can be traced to its cause.
-#   0006-push-preview-restores-remembered-session.patch: a "remember me" sign-in keeps a 30-day cookie
-#     but its context cookie ends with the browser session, so a phone's browser restarted by a push
-#     comes back without it and the preview answered 401. The preview now rebuilds the context from
-#     the remembered sign-in, through the helper the app's own restore uses.
-#   0007-push-preview-restores-oauth-session.patch: the same for an OAuth sign-in (what a TOTP account
-#     gets), which keeps only its 30-day refresh token across that restart: the preview renews from it,
-#     opens the session, and stores the rebuilt context only once that has worked.
-#   0008-files-no-stability-banner.patch: the Files page no longer shows its "Large file uploads can
-#     cause server instability" banner. It describes Stalwart on RocksDB; ours is PostgreSQL + R2, where
-#     a file's bytes go to R2 (measured). Stalwart bounds each upload (25 MiB per request and per file)
-#     and each account (4 requests at once); a server-wide bound is tracked as a scaling item, not
-#     left to a banner (MAI-263).
-#   0009-files-upload-errors-say-why.patch: a refused Files upload shows the server's reason (malware,
-#     could not be scanned, too large) after "Failed to upload file", not the bare generic toast.
-#   0010-restore-keeps-session-through-outage.patch: a page load during a server outage keeps the
-#     remembered sign-in. The restore signed the user out on a request timeout, or on a fetch that
-#     failed while a re-probe got through (what a load balancer switching origins produces); both are
-#     now treated as the outage they are. A real rejection still signs out.
-#   0011-token-session-keeps-account-security.patch: a two-step sign-in (a token session) shows Change
-#     Password, Display Name and Two-Factor Authentication, as a password sign-in does; upstream hid them,
-#     so a two-step user could not change their password or turn two-step off (Stalwart accepts all three
-#     on the bearer token, measured). After a password change, which revokes the session's tokens, the
-#     session signs in again with the new password and the confirming code. Email Client Setup and Link
-#     Mobile App (for upstream's own app and JMAP clients, which this deployment does not offer) are no longer shown.
-#   0012-totp-issuer-is-app-name.patch: the otpauth URL a two-step enrolment shows names this webmail
-#     (APP_NAME) as its issuer, not 'Stalwart', so the user's authenticator app names the entry after the
-#     service they signed up for (MainThrive MAI-947).
-#   0013-mobile-send-returns-to-list.patch: on a phone, sending a new message from the list returns to
-#     the list. Upstream closed the composer and left the reading pane up with nothing in it, so the user
-#     landed on "No conversation selected" (MainThrive MAI-1010). A reply still returns to its message.
-#   0014-password-change-asks-for-the-next-code.patch: after a password change in a two-step session, the form asks
-#     for the NEXT code to stay signed in, instead of 0011's re-sign-in with the code the change was confirmed with:
-#     MainThrive's Stalwart accepts a code once (stalwart-r2-patch 0012, MAI-997), so that reuse is refused. A refused
-#     code is asked for again; declining, or leaving the page, ends the session as expired, as before 0011.
+#     image (PWA_BADGE_URL), in all four of the service worker's notifications. Android draws the badge from
+#     its alpha channel alone, so an opaque PWA icon is a solid square there.
+#   0005-push-preview-says-why.patch: the push preview logs a warning where it answers 401 without a word
+#     (never a value; the names of the cookies that came), so a generic notification can be traced.
+#   0007-push-preview-restores-oauth-session.patch: a token sign-in (password plus two-step) whose browser was
+#     restarted keeps only its refresh token, sign-in stamp and server cookie; the preview renews from them
+#     through upstream's own renewal and rebuilds the context. Upstream rebuilds only a remembered Basic sign-in.
 #   0015-ios-safari-install-steps.patch: on an iPhone or iPad in Safari, which never fires beforeinstallprompt, the
-#     Install card shows the Add to Home Screen steps, with an arrow toward Safari's toolbar, instead of never
-#     appearing. Once signed in, never once the app is opened from the Home Screen, nor in another iOS browser
-#     (MainThrive MAI-1181).
-#   0016-shared-store-postgres.patch: with SHARED_STORE=postgres, the settings-sync blobs and the device-pairing codes,
-#     which upstream keeps in files and in process memory, live in PostgreSQL instead, so two or more instances behind one
-#     load balancer agree on both (MainThrive MAI-1406). Same blob, same key, TLS verified; it fails closed, never
-#     falling back to a local file. Adds the `pg` dependency. Off, nothing changes.
+#     Install card shows the Add to Home Screen steps (MainThrive MAI-1181).
+#   0016-shared-store-postgres.patch: a PostgreSQL backend for upstream's shared store (#1066), beside local and
+#     redis, with SHARED_STORE=postgres: everything two instances behind one load balancer must agree on, in one
+#     database (MainThrive MAI-1406, MAI-1442). It carries over the settings the earlier 0016 kept. Adds `pg`.
+#   0017-no-link-mobile-app.patch: Settings > Security shows no "Link mobile app" card, for Bulwark's own phone app,
+#     which MainThrive neither documents nor supports (MainThrive MAI-1442).
 # Everything else is upstream: the tag's source, its Dockerfile. The image is pushed only after an
 # end-to-end check against the built image passes. The release tag is pushed only from main; a dispatch
 # from another branch pushes branch-<short sha> instead, and a pull request runs every step but the
@@ -91,10 +56,10 @@ concurrency:
 
 env:
   # Upstream Bulwark release, pinned by commit: a tag can move, a commit cannot.
-  BULWARK_TAG: "1.11.2"
-  BULWARK_SHA: e2a414593906ea01bc120bb96bf6428932a1590e
+  BULWARK_TAG: "1.21.2"
+  BULWARK_SHA: 933bc18f517135e38245821c5cc1bc7117ce2d64
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
-  VERSION: 1.11.2-clientip.19
+  VERSION: 1.21.2-clientip.20
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
   # webmail host. Baked into the client bundle.
   PUSH_RELAY_URL: https://webmail.mainthrive.com/relay
@@ -168,81 +133,49 @@ jobs:
         run: |
           set -eu
           for p in ../patch/patches/0001-forward-client-ip-to-jmap.patch ../patch/patches/0002-push-relay-build-arg.patch \
-                   ../patch/patches/0003-push-preview-renews-expired-session.patch \
                    ../patch/patches/0004-notification-badge.patch \
                    ../patch/patches/0005-push-preview-says-why.patch \
-                   ../patch/patches/0006-push-preview-restores-remembered-session.patch \
                    ../patch/patches/0007-push-preview-restores-oauth-session.patch \
-                   ../patch/patches/0008-files-no-stability-banner.patch \
-                   ../patch/patches/0009-files-upload-errors-say-why.patch \
-                   ../patch/patches/0010-restore-keeps-session-through-outage.patch \
-                   ../patch/patches/0011-token-session-keeps-account-security.patch \
-                   ../patch/patches/0012-totp-issuer-is-app-name.patch \
-                   ../patch/patches/0013-mobile-send-returns-to-list.patch \
-                   ../patch/patches/0014-password-change-asks-for-the-next-code.patch \
                    ../patch/patches/0015-ios-safari-install-steps.patch \
-                   ../patch/patches/0016-shared-store-postgres.patch; do
+                   ../patch/patches/0016-shared-store-postgres.patch \
+                   ../patch/patches/0017-no-link-mobile-app.patch; do
             git apply --check "$p"
             git apply "$p"
           done
           got=$(git status --porcelain | LC_ALL=C sort | tr '\n' '|')
-          want=$(printf '%s\n' ' M Dockerfile' ' M instrumentation.node.ts' '?? lib/__tests__/jmap-upstream-fetch.test.ts' '?? lib/server/' \
-            ' M app/api/auth/token/route.ts' ' M app/api/push/preview/route.ts' ' M lib/__tests__/push-preview-route.test.ts' \
-            '?? lib/oauth/refresh-slot.ts' '?? lib/__tests__/refresh-slot.test.ts' \
-            ' M .env.example' ' M app/api/pwa-icon/[size]/route.ts' ' M lib/admin/types.ts' ' M public/sw.js' \
-            '?? lib/__tests__/pwa-icon-badge.test.ts' \
-            ' M app/api/auth/session/route.ts' ' M lib/stalwart/auth-context.ts' '?? lib/__tests__/auth-context-restore.test.ts' \
-            ' M components/files/files-app.tsx' \
-            ' M stores/auth-store.ts' '?? stores/__tests__/auth-store-restore-outage.test.ts' \
-            ' M components/settings/account-security-settings.tsx' ' M stores/account-security-store.ts' \
-            ' M stores/__tests__/account-security-store.test.ts' '?? stores/__tests__/auth-store-token-password.test.ts' \
-            '?? components/settings/__tests__/account-security-token-session.test.tsx' \
-            '?? components/settings/__tests__/account-security-totp-issuer.test.tsx' \
-            ' M components/mail/mail-app.tsx' \
-            ' M locales/en/common.json' '?? components/settings/__tests__/account-security-next-code.test.tsx' \
-            ' M components/pwa-install-prompt.tsx' '?? components/__tests__/pwa-install-prompt-ios.test.tsx' \
-            ' M app/api/auth/pair/create/route.ts' ' M app/api/auth/pair/redeem/route.ts' ' M lib/auth/crypto.ts' \
-            ' M lib/auth/pairing-store.ts' ' M lib/settings-sync.ts' ' M package.json' ' M package-lock.json' \
-            '?? lib/__tests__/shared-store.test.ts' | LC_ALL=C sort | tr '\n' '|')
+          want=$(printf '%s\n' ' M .env.example' ' M Dockerfile' ' M app/api/push/preview/route.ts' ' M app/api/pwa-icon/[size]/route.ts' \
+            ' M components/pwa-install-prompt.tsx' ' M components/settings/__tests__/link-device-section.test.tsx' \
+            ' M components/settings/account-security-settings.tsx' ' M instrumentation.node.ts' ' M lib/admin/types.ts' \
+            ' M lib/shared-store/index.ts' ' M lib/shared-store/types.ts' ' M lib/stalwart/push-token-renewal.ts' \
+            ' M locales/en/common.json' ' M package-lock.json' ' M package.json' ' M public/sw.js' \
+            '?? components/__tests__/pwa-install-prompt-ios.test.tsx' '?? lib/__tests__/jmap-upstream-fetch.test.ts' \
+            '?? lib/__tests__/pwa-icon-badge.test.ts' '?? lib/server/' '?? lib/shared-store/__tests__/postgres-store.test.ts' \
+            '?? lib/shared-store/postgres.ts' | LC_ALL=C sort | tr '\n' '|')
           [ "$got" = "$want" ] || { echo "::error::unexpected change set: $got"; exit 1; }
-          # 0008: the Files page renders no stability banner.
-          ! grep -n 'stability_warning' components/files/files-app.tsx || { echo "::error::the Files banner is still rendered"; exit 1; }
-          # 0009: both Files upload handlers show the server's reason.
-          [ "$(grep -cF 'toast.error(uploadErrorText(err));' components/files/files-app.tsx)" = 2 ] \
-            && grep -qF 'err.message ? `${t("upload_error")}: ${err.message}`' components/files/files-app.tsx \
-            || { echo "::error::a Files upload error does not show the server's reason"; exit 1; }
-          # 0010: the restore counts a timeout and CORS_ERROR as an outage.
-          grep -qF 'if (error instanceof RequestTimeoutError) return true;' stores/auth-store.ts \
-            && grep -qF "if (error instanceof Error && error.message === 'CORS_ERROR') return true;" stores/auth-store.ts \
-            || { echo "::error::the restore still signs out on a timeout or CORS_ERROR"; exit 1; }
-          # 0011: no section of the Security page depends on how the session signed in, and a password
-          # change renews a token session.
-          ! grep -nE "isOAuth|authMode === 'oauth'" components/settings/account-security-settings.tsx \
-            && grep -qF 'keepTokenSessionThrough(' stores/account-security-store.ts \
-            || { echo "::error::a token session's Security page still differs, or a password change does not renew it"; exit 1; }
-          # 0012: the TOTP issuer is the configured app name, never the mail server's.
-          ! grep -n "issuer: 'Stalwart'" components/settings/account-security-settings.tsx \
-            && grep -qF "generateTotp(client?.getUsername() ?? 'account', appName || 'Webmail')" components/settings/account-security-settings.tsx \
-            || { echo "::error::the TOTP enrolment still names Stalwart as its issuer"; exit 1; }
-          # 0013: both send paths return a phone to the list when nothing is left to read.
-          [ "$(grep -cF 'returnToListIfNothingToRead();' components/mail/mail-app.tsx)" = 2 ] \
-            || { echo "::error::a send on a phone still leaves the empty reading pane up"; exit 1; }
-          # 0014: the re-sign-in after a password change asks for the next code, never reuses the confirming one.
-          grep -qF 'const totp = nextCode ? await nextCode(tries > 0) : undefined;' stores/auth-store.ts \
-            && ! grep -nF 'totp: otpCode,' stores/auth-store.ts \
-            || { echo "::error::a password change still signs in again with the code it was confirmed with"; exit 1; }
+          # 0004: every notification the service worker shows asks for the badge, none for the plain icon.
+          [ "$(grep -cF 'badge: `${BASE_PATH}/api/pwa-icon/192?purpose=badge`' public/sw.js)" = 4 ] \
+            && ! grep -nF 'badge: `${BASE_PATH}/api/pwa-icon/192`,' public/sw.js \
+            || { echo "::error::a notification's badge is still the PWA icon"; exit 1; }
+          # 0005: the preview's silent 401s say why.
+          grep -qF "logger.warn('push preview could not open the session'" app/api/push/preview/route.ts \
+            && grep -qF "logger.warn('push preview found no session for the account'" app/api/push/preview/route.ts \
+            || { echo "::error::the push preview still answers 401 without a word"; exit 1; }
+          # 0007: a token sign-in that kept only its refresh token is rebuilt for the preview.
+          grep -qF 'await restorePushContextFromRefreshToken(cookieStore, restoreSlot, basePath' app/api/push/preview/route.ts \
+            || { echo "::error::the preview does not rebuild a token sign-in from its refresh token"; exit 1; }
           # 0015: iOS Safari gets the install steps once signed in, and only while the app is not opened from the Home Screen.
           grep -qF 'const show = isAuthenticated && !isStandalone();' components/pwa-install-prompt.tsx \
             || { echo "::error::iOS Safari still gets no install card"; exit 1; }
-          # 0016: settings and pairing go to the shared store when it is on, and both pair routes wait for it; the only
-          # dependency added is pg (and its types).
-          grep -qF 'if (shared) return putSettingsBlob(settingsKey(username, serverUrl), data);' lib/settings-sync.ts \
-            && grep -qF 'const blob = await takePairing(codeHash(code));' lib/auth/pairing-store.ts \
-            && grep -qF 'await createPairing({' app/api/auth/pair/create/route.ts \
-            && grep -qF 'await consumePairing(pairingCode)' app/api/auth/pair/redeem/route.ts \
-            || { echo "::error::settings or pairing codes still stay per instance with the shared store on"; exit 1; }
+          # 0016: SHARED_STORE=postgres selects the PostgreSQL backend; the only dependency added is pg (and its types).
+          grep -qF 'if (postgresStoreSelected()) return POSTGRES_URL;' lib/shared-store/index.ts \
+            && grep -qF '? createPostgresStore()' lib/shared-store/index.ts \
+            || { echo "::error::SHARED_STORE=postgres does not select the PostgreSQL store"; exit 1; }
           [ "$(git diff -U0 package.json | grep -E '^\+ ' | tr -d ' ' | LC_ALL=C sort | tr '\n' '|')" = '+"@types/pg":"8.23.1",|+"pg":"8.23.1",|' ] \
             || { echo "::error::package.json changed beyond pg 8.23.1 and its types"; exit 1; }
+          # 0017: no Link mobile app card, on either of the Security page's layouts.
+          grep -qF 'const OFFER_MOBILE_APP = false;' components/settings/account-security-settings.tsx \
+            && [ "$(grep -cF '{OFFER_MOBILE_APP && ' components/settings/account-security-settings.tsx)" = 2 ] \
+            || { echo "::error::the Security page still offers Link mobile app"; exit 1; }
 
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444  # v5.0.0
         with:
@@ -253,19 +186,29 @@ jobs:
         run: |
           set -eu
           npm ci --no-audit --no-fund --ignore-scripts
-          npx vitest run lib/__tests__/jmap-upstream-fetch.test.ts lib/__tests__/push-preview-route.test.ts lib/__tests__/refresh-slot.test.ts \
-            lib/__tests__/oauth-token-route.test.ts lib/__tests__/auth-routes-same-origin.test.ts \
-            lib/__tests__/pwa-icon-badge.test.ts lib/__tests__/domain-branding.test.ts lib/__tests__/branding-asset.test.ts \
-            lib/__tests__/auth-context-restore.test.ts lib/__tests__/impersonation-session.test.ts \
-            lib/__tests__/auth-routes-credential-check.test.ts lib/__tests__/settings-route-account-key.test.ts \
-            lib/__tests__/wopi-token-not-a-session.test.ts stores/__tests__/auth-store-restore-outage.test.ts \
-            stores/__tests__/auth-store-token-password.test.ts stores/__tests__/account-security-store.test.ts \
-            components/settings/__tests__/account-security-token-session.test.tsx \
-            components/settings/__tests__/account-security-totp-issuer.test.tsx \
-            components/settings/__tests__/account-security-next-code.test.tsx \
+          # The cold first import of a route test takes several seconds on a busy machine; the default 5 s is a flake.
+          npx vitest run --testTimeout=30000 \
+            lib/__tests__/jmap-upstream-fetch.test.ts lib/__tests__/pwa-icon-badge.test.ts \
+            lib/__tests__/push-preview-route.test.ts lib/__tests__/push-preview-route-ambiguous.test.ts \
+            lib/__tests__/push-preview-route-owner.test.ts lib/__tests__/push-preview-token-renewal.test.ts \
+            lib/__tests__/push-auth-context.test.ts lib/__tests__/push-preview-device-policy.test.ts \
+            lib/__tests__/sw-push-delivery.test.ts lib/__tests__/settings-route-account-key.test.ts \
             components/__tests__/pwa-install-prompt.test.tsx components/__tests__/pwa-install-prompt-ios.test.tsx \
-            lib/__tests__/shared-store.test.ts lib/__tests__/settings-route-account-key.test.ts
+            components/settings/__tests__/link-device-section.test.tsx components/settings/__tests__/account-security-signin.test.tsx \
+            components/settings/__tests__/account-security-mail-apps.test.tsx \
+            lib/shared-store
           npx tsc --noEmit -p tsconfig.json
+
+      - name: The shared store contract (upstream's) against a real PostgreSQL, for 0016
+        working-directory: bulwark
+        run: |
+          set -eu
+          pw=$(openssl rand -hex 16)
+          docker run -d --name contract-pg -p 127.0.0.1:55432:5432 -e POSTGRES_USER=bulwark -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=bulwark postgres:18.4 >/dev/null
+          for _ in $(seq 1 60); do docker exec contract-pg pg_isready -h 127.0.0.1 -U bulwark -d bulwark >/dev/null 2>&1 && break; sleep 1; done
+          IT_SHARED_STORE_PG=1 PGHOST=127.0.0.1 PGPORT=55432 PGUSER=bulwark PGDATABASE=bulwark PGPASSWORD="$pw" PGSSLMODE=disable \
+            npx vitest run --testTimeout=60000 lib/shared-store/__tests__/postgres-store.test.ts
+          docker rm -f contract-pg >/dev/null
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
@@ -286,7 +229,7 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
-            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP, ${{ env.PUSH_RELAY_URL }} as its push relay, push previews that renew an expired session, and a notification badge of its own
+            org.opencontainers.image.description=Bulwark ${{ env.BULWARK_TAG }} with server-side JMAP requests sent privately and carrying the client IP, ${{ env.PUSH_RELAY_URL }} as its push relay, a notification badge of its own, and its shared store on PostgreSQL
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha
           # Only main writes the cache: a pull request reads main's, and a build cache written per
@@ -296,8 +239,8 @@ jobs:
       - name: End-to-end against the built image
         run: bash patch/scripts/e2e.sh "${IMAGE}:${VERSION}" "${PUSH_RELAY_URL}"
 
-      - name: End-to-end, a real Stalwart - the push preview after the access token expired
-        run: bash patch/scripts/e2e-preview-renewal.sh "${IMAGE}:${VERSION}"
+      - name: End-to-end, a real Stalwart - the push preview after the access token expired, and after a restart
+        run: bash patch/scripts/e2e-preview-renewal.sh "${IMAGE}:${VERSION}" renews
 
       - name: End-to-end, the notification badge has its own image
         run: bash patch/scripts/e2e-badge.sh "${IMAGE}:${VERSION}"
@@ -313,6 +256,9 @@ jobs:
 
       - name: End-to-end, the same two instances with the store off - each keeps its own (the negative control)
         run: bash patch/scripts/e2e-shared-store.sh "${IMAGE}:${VERSION}" separate
+
+      - name: End-to-end, the upgrade - settings today's image saved are what both instances of this one load
+        run: bash patch/scripts/e2e-shared-store.sh "${IMAGE}:${VERSION}" upgrade
 
       # ⛔ The release tag is pushed only from main (a push, or a dispatch on main). A dispatch from any
       # other branch pushes the same tested image under branch-<short sha> alone, never the release tag,

@@ -1,11 +1,11 @@
 diff --git a/instrumentation.node.ts b/instrumentation.node.ts
-index 365427d..69b7aff 100644
+index 971184ac8..64ac111d8 100644
 --- a/instrumentation.node.ts
 +++ b/instrumentation.node.ts
-@@ -4,6 +4,10 @@ import { initAdminPassword } from "./lib/admin/password";
- import { migrateLegacyAdminLayout, migratePolicyUnifiedMailbox } from "./lib/admin/migrate";
- import { detectSetupState } from "./lib/setup/state";
- import { ensureSetupToken } from "./lib/setup/token";
+@@ -10,6 +10,10 @@ import { bootSharedMode } from "./lib/shared-store/boot";
+ import { importLocalData } from "./lib/shared-store/import";
+ import { exportSharedData } from "./lib/shared-store/export";
+ import { logger, isJsonLogFormat } from "./lib/logger";
 +import { installJmapUpstreamFetch } from "./lib/server/jmap-upstream-fetch";
 +
 +// Opt-in: send server-side JMAP requests privately and with the visitor's IP.
@@ -15,7 +15,7 @@ index 365427d..69b7aff 100644
    readFileSync(`${process.cwd()}/package.json`, "utf-8")
 diff --git a/lib/__tests__/jmap-upstream-fetch.test.ts b/lib/__tests__/jmap-upstream-fetch.test.ts
 new file mode 100644
-index 0000000..e3a2496
+index 000000000..e3a24962d
 --- /dev/null
 +++ b/lib/__tests__/jmap-upstream-fetch.test.ts
 @@ -0,0 +1,171 @@
@@ -192,7 +192,7 @@ index 0000000..e3a2496
 +});
 diff --git a/lib/server/jmap-upstream-fetch.ts b/lib/server/jmap-upstream-fetch.ts
 new file mode 100644
-index 0000000..51e1b7b
+index 000000000..51e1b7b32
 --- /dev/null
 +++ b/lib/server/jmap-upstream-fetch.ts
 @@ -0,0 +1,175 @@

@@ -68,9 +68,12 @@ after=$(docker logs e2e-echo 2>&1 | wc -l)
 [ "$before" = "$after" ] || { echo "::error::the stub was reached without opting in"; exit 1; }
 if [ -n "$RELAY" ]; then
   echo "== the push relay is ours, baked into the shipped code, and the hosted one is not"
+  # The hosted relay's URL, with its scheme: what a client would register with. Since 1.20 its bare host name
+  # also sits in upstream's lists of outside hosts (lib/outgoing-hosts.ts, the admin's registry), which name it
+  # and never call it, so the host alone is no longer the test.
   ours=$(docker run --rm --entrypoint sh "$IMAGE" -c "grep -rlF '$RELAY' /app/.next | wc -l")
-  hosted=$(docker run --rm --entrypoint sh "$IMAGE" -c "grep -rlF 'notifications.relay.bulwarkmail.org' /app/.next | wc -l")
-  echo "files naming $RELAY: $ours; naming the hosted relay: $hosted"
+  hosted=$(docker run --rm --entrypoint sh "$IMAGE" -c "grep -rlF 'https://notifications.relay.bulwarkmail.org' /app/.next | wc -l")
+  echo "files naming $RELAY: $ours; naming the hosted relay's URL: $hosted"
   [ "$ours" -gt 0 ] || { echo "::error::$RELAY is not in the built code"; exit 1; }
   [ "$hosted" -eq 0 ] || { echo "::error::the hosted relay is still in the built code"; exit 1; }
 fi

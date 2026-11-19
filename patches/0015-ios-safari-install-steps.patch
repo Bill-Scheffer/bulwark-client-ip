@@ -1,13 +1,14 @@
 diff --git a/components/__tests__/pwa-install-prompt-ios.test.tsx b/components/__tests__/pwa-install-prompt-ios.test.tsx
 new file mode 100644
-index 0000000..08e4652
+index 000000000..fbc02ffe9
 --- /dev/null
 +++ b/components/__tests__/pwa-install-prompt-ios.test.tsx
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,129 @@
 +import { act, fireEvent, render, screen } from "@testing-library/react";
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +import { isIosSafari, PWAInstallPrompt } from "../pwa-install-prompt";
 +import { useAuthStore } from "@/stores/auth-store";
++import { useUIStore } from "@/stores/ui-store";
 +
 +vi.mock("@/hooks/use-config", () => ({
 +  useConfig: () => ({ appName: "Bulwark", faviconUrl: "", appLogoLightUrl: "", appLogoDarkUrl: "" }),
@@ -37,6 +38,7 @@ index 0000000..08e4652
 +  beforeEach(() => {
 +    localStorage.clear();
 +    useAuthStore.setState({ isAuthenticated: true });
++    useUIStore.setState({ composingCount: 0 });
 +  });
 +  afterEach(() => {
 +    vi.restoreAllMocks();
@@ -56,7 +58,7 @@ index 0000000..08e4652
 +    asDevice(IPHONE_SAFARI, 5);
 +    render(<PWAInstallPrompt />);
 +    const dialog = screen.getByRole("dialog");
-+    expect(dialog.className).toContain("bottom-[calc(4rem+env(safe-area-inset-bottom)/2)]");
++    expect(dialog.className).toContain("bottom-[calc(var(--bottom-controls-height,3.75rem)+0.75rem)]");
 +    expect([...dialog.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["ios_step_share", "ios_step_add", "ios_step_confirm"]);
 +    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("animate-bounce");
 +    expect(dialog.querySelector("li svg")!.getAttribute("class")).toContain("arrow-down");
@@ -107,33 +109,51 @@ index 0000000..08e4652
 +    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 +  });
 +
-+  it("Not now hides it for this visit only", () => {
++  // Upstream's Not now (#1411) holds the card back for a week; the iOS card follows it.
++  it("Not now holds it back for a week, then shows it again", () => {
++    vi.useFakeTimers({ toFake: ["Date"] });
 +    asDevice(IPHONE_SAFARI, 5);
 +    const { unmount } = render(<PWAInstallPrompt />);
 +    fireEvent.click(screen.getByText("not_now"));
 +    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 +    unmount();
++    const again = render(<PWAInstallPrompt />);
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    again.unmount();
++    vi.setSystemTime(Date.now() + 7 * 24 * 60 * 60 * 1000 + 1000);
 +    render(<PWAInstallPrompt />);
 +    expect(screen.getByRole("dialog")).toBeInTheDocument();
++    vi.useRealTimers();
++  });
++
++  it("stays out of the way while a message is being written", () => {
++    useUIStore.setState({ composingCount: 1 });
++    asDevice(IPHONE_SAFARI, 5);
++    render(<PWAInstallPrompt />);
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
 +  });
 +});
 diff --git a/components/pwa-install-prompt.tsx b/components/pwa-install-prompt.tsx
-index 20195bd..07d097f 100644
+index 6e0af3561..3e227e9b1 100644
 --- a/components/pwa-install-prompt.tsx
 +++ b/components/pwa-install-prompt.tsx
-@@ -2,9 +2,10 @@
+@@ -2,13 +2,14 @@
  
  import { useEffect, useState } from "react";
  import { useTranslations } from "next-intl";
 -import { X, Download } from "@/components/icons";
 +import { X, Download, ArrowDown, ArrowUp, Share2 } from "@/components/icons";
+ import { Button } from "@/components/ui/button";
+ import { IconButton } from "@/components/ui/icon-button";
  import { useConfig } from "@/hooks/use-config";
  import { withBasePath } from "@/lib/browser-navigation";
+ import { useUIStore } from "@/stores/ui-store";
+ import { useStrictestDevices } from "@/hooks/use-device-policy";
 +import { useAuthStore } from "@/stores/auth-store";
  
  interface BeforeInstallPromptEvent extends Event {
    prompt: () => Promise<void>;
-@@ -23,16 +24,52 @@ export function isPWAInstallPromptVisible(): boolean {
+@@ -47,10 +48,38 @@ export function isPWAInstallPromptVisible(): boolean {
    return promptVisible;
  }
  
@@ -167,13 +187,14 @@ index 20195bd..07d097f 100644
    const [showPrompt, setShowPrompt] = useState(false);
 +  // iOS Safari: steps to follow, since there is no prompt to call.
 +  const [iosSteps, setIosSteps] = useState<"iphone" | "ipad" | null>(null);
-   const { appName, faviconUrl, appLogoLightUrl, appLogoDarkUrl } = useConfig();
-   const t = useTranslations("pwa_install");
 +  // The iOS steps wait for sign-in: on the sign-in page the card would sit over its controls.
 +  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
- 
-   useEffect(() => {
-     if (localStorage.getItem(DISMISSED_KEY)) return;
+   const { appName, faviconUrl, appLogoLightUrl, appLogoDarkUrl } = useConfig();
+   const t = useTranslations("pwa_install");
+   // Stays "visible" for the push prompt's sake while a composer is open, so
+@@ -69,6 +98,14 @@ export function PWAInstallPrompt() {
+     }
+     if (isDismissed()) return;
  
 +    if (isIosSafari()) {
 +      // Signed out (or never signed in) hides it again: the sign-in page is where it would be in the way.
@@ -186,21 +207,21 @@ index 20195bd..07d097f 100644
      const handler = (e: Event) => {
        e.preventDefault();
        setDeferredPrompt(e as BeforeInstallPromptEvent);
-@@ -44,7 +81,7 @@ export function PWAInstallPrompt() {
+@@ -80,7 +117,7 @@ export function PWAInstallPrompt() {
      return () => {
        window.removeEventListener("beforeinstallprompt", handler);
      };
--  }, []);
-+  }, [isAuthenticated]);
+-  }, [noInstallPrompt]);
++  }, [noInstallPrompt, isAuthenticated]);
  
+   const visible = showPrompt && !noInstallPrompt;
    useEffect(() => {
-     promptVisible = showPrompt;
-@@ -80,13 +117,70 @@ export function PWAInstallPrompt() {
+@@ -118,13 +155,59 @@ export function PWAInstallPrompt() {
      setShowPrompt(false);
    };
  
--  if (!showPrompt || !deferredPrompt) {
-+  if (!showPrompt || (!deferredPrompt && !iosSteps)) {
+-  if (!visible || !deferredPrompt || composing) {
++  if (!visible || (!deferredPrompt && !iosSteps) || composing) {
      return null;
    }
  
@@ -209,69 +230,58 @@ index 20195bd..07d097f 100644
  
 +  if (iosSteps) {
 +    // The first step's icon is the arrow, bouncing toward Safari's toolbar. On a phone the card sits above webmail's
-+    // own tab bar (3.25rem and half the safe area), so it never covers it, and the arrow never lands on a tab.
++    // own tab bar, as the install card does, so it never covers it and the arrow never lands on a tab.
 +    const Arrow = iosSteps === "ipad" ? ArrowUp : ArrowDown;
 +    return (
 +      <div
 +        role="dialog"
 +        aria-label={t("title", { appName })}
-+        className={`fixed z-50 inset-x-4 mx-auto max-w-sm ${iosSteps === "ipad" ? "top-4 sm:inset-x-auto sm:right-4" : "bottom-[calc(4rem+env(safe-area-inset-bottom)/2)]"}`}
++        className={`fixed z-50 inset-x-3 mx-auto max-w-sm rounded-lg border border-border bg-popover text-popover-foreground shadow-lg p-4 ${iosSteps === "ipad" ? "top-4 sm:inset-x-auto sm:end-4" : "bottom-[calc(var(--bottom-controls-height,3.75rem)+0.75rem)]"}`}
 +      >
-+        <div className="bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-neutral-200 dark:border-neutral-800 p-4">
-+          <div className="flex items-start justify-between mb-3">
-+            <div>
-+              <h3 className="font-semibold text-sm text-neutral-900 dark:text-white">{t("title", { appName })}</h3>
-+              <p className="text-xs text-neutral-600 dark:text-neutral-400 mt-1">{t("ios_description")}</p>
-+            </div>
-+            <button
-+              onClick={handleDismiss}
-+              className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 transition-colors"
-+              aria-label={t("dismiss_aria")}
-+            >
-+              <X className="w-4 h-4" />
-+            </button>
++        <div className="flex items-start justify-between mb-3">
++          <div>
++            <h3 className="font-semibold text-sm text-foreground">{t("title", { appName })}</h3>
++            <p className="text-xs text-muted-foreground mt-1">{t("ios_description")}</p>
 +          </div>
-+          <ol className="space-y-2 mb-3 text-sm text-neutral-800 dark:text-neutral-200">
-+            <li className="flex items-start gap-2">
-+              <Arrow className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400 animate-bounce" aria-hidden="true" />
-+              <span>{t(iosSteps === "ipad" ? "ios_step_share_ipad" : "ios_step_share")}</span>
-+            </li>
-+            <li className="flex items-start gap-2">
-+              <Share2 className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400" aria-hidden="true" />
-+              <span>{t("ios_step_add")}</span>
-+            </li>
-+            <li className="flex items-start gap-2">
-+              <Download className="w-5 h-5 shrink-0 text-blue-600 dark:text-blue-400" aria-hidden="true" />
-+              <span>{t("ios_step_confirm")}</span>
-+            </li>
-+          </ol>
-+          <div className="flex gap-2">
-+            <button
-+              onClick={handleDismiss}
-+              className="flex-1 px-3 py-2 text-sm font-medium text-neutral-700 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-colors"
-+            >
-+              {t("not_now")}
-+            </button>
-+            <button
-+              onClick={handleDismissForever}
-+              className="flex-1 px-3 py-2 text-sm font-medium text-neutral-700 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 rounded hover:bg-neutral-200 dark:hover:bg-neutral-700 transition-colors"
-+            >
-+              {t("dont_remind")}
-+            </button>
-+          </div>
++          <IconButton label={t("dismiss_aria")} onClick={handleDismiss} className="-me-2 -mt-2 text-muted-foreground">
++            <X />
++          </IconButton>
++        </div>
++        <ol className="space-y-2 mb-3 text-sm text-foreground">
++          <li className="flex items-start gap-2">
++            <Arrow className="w-5 h-5 shrink-0 text-primary animate-bounce" aria-hidden="true" />
++            <span>{t(iosSteps === "ipad" ? "ios_step_share_ipad" : "ios_step_share")}</span>
++          </li>
++          <li className="flex items-start gap-2">
++            <Share2 className="w-5 h-5 shrink-0 text-primary" aria-hidden="true" />
++            <span>{t("ios_step_add")}</span>
++          </li>
++          <li className="flex items-start gap-2">
++            <Download className="w-5 h-5 shrink-0 text-primary" aria-hidden="true" />
++            <span>{t("ios_step_confirm")}</span>
++          </li>
++        </ol>
++        {/* Don't remind me again is a button like Not now, not faint text that looks disabled (MainThrive MAI-1181). */}
++        <div className="flex gap-2">
++          <Button type="button" variant="outline" size="sm" className="flex-1" onClick={handleDismiss}>
++            {t("not_now")}
++          </Button>
++          <Button type="button" variant="outline" size="sm" className="flex-1" onClick={handleDismissForever}>
++            {t("dont_remind")}
++          </Button>
 +        </div>
 +      </div>
 +    );
 +  }
 +
    return (
-     <div className="fixed bottom-4 right-4 z-50 bg-white dark:bg-neutral-900 rounded-lg shadow-lg border border-neutral-200 dark:border-neutral-800 p-4 max-w-sm animate-in slide-in-from-bottom-4">
+     <div className="fixed bottom-4 end-4 z-50 max-w-sm rounded-lg border border-border bg-popover text-popover-foreground shadow-lg p-4 animate-in slide-in-from-bottom-4 max-sm:inset-x-3 max-sm:max-w-none max-sm:bottom-[calc(var(--bottom-controls-height,3.75rem)+0.75rem)]">
        <div className="flex items-start justify-between mb-3">
 diff --git a/locales/en/common.json b/locales/en/common.json
-index 228f259..a1124dc 100644
+index d61b97e47..dbe693a33 100644
 --- a/locales/en/common.json
 +++ b/locales/en/common.json
-@@ -3602,7 +3602,12 @@
+@@ -6356,7 +6356,12 @@
      "not_now": "Not now",
      "install": "Install",
      "dont_remind": "Don't remind me again",
@@ -283,5 +293,5 @@ index 228f259..a1124dc 100644
 +    "ios_step_add": "Scroll down and tap Add to Home Screen.",
 +    "ios_step_confirm": "If you see Open as Web App, leave it on. Then tap Add."
    },
-   "deep_link": {
-     "message_not_found": "This message is no longer available.",
+   "app_update": {
+     "ready": "A new version of {appName} is ready.",
