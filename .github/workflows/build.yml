@@ -56,8 +56,8 @@ concurrency:
 
 env:
   # Upstream Bulwark release, pinned by commit: a tag can move, a commit cannot.
-  BULWARK_TAG: "1.21.2"
-  BULWARK_SHA: 933bc18f517135e38245821c5cc1bc7117ce2d64
+  BULWARK_TAG: "1.22.0"
+  BULWARK_SHA: 2ee1e031d75fa85b0f36776e09bac6b67371f6dc
   IMAGE: ghcr.io/bill-scheffer/bulwark-client-ip
   VERSION: 1.21.2-clientip.20
   # Our self-hosted push relay (github.com/Bill-Scheffer/bulwark-relay-hardened), served under the
